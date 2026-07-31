@@ -1,4 +1,4 @@
-# 🛡️ mobile443 v0.5
+# 🛡️ mobile443 v0.7
 
 > ⚠️ **Список сетей Ростелекома (замена `AS12389`) пока в режиме
 > тестирования.** 31 сеть в `static_networks.conf` — это стартовый
@@ -6,7 +6,10 @@
 > мобильные сети оператора (или нашли баг в другой части замены ASN) —
 > присылайте pull request, будем рады.
 
-Фильтр для VPN-портов, который теперь работает в два слоя:
+> ℹ️ **С v0.7 фильтр работает на `nftables`** — своя таблица
+> `ip mobile443`, которую не трогают ни Docker, ни UFW.
+
+Фильтр для VPN-портов, который работает в два слоя:
 
 1. 🚫 `traf_guard` сначала дропает IP из blocklist
 2. 📶 затем `mobile allowlist` пускает только IP из мобильных ASN + точечных сетей
@@ -24,6 +27,69 @@
 управление фильтром без переустановки: обновление списков, точечные исключения,
 диагностика, статистика и настройка Telegram/Remnawave. См. раздел «🎛 Консоль
 управления mobile443» ниже.
+
+## ✨ Что изменилось в v0.7
+
+### 🔀 Переход на nftables
+
+Весь фильтр переехал с `iptables + ipset` на **`nftables`** — собственная
+таблица `ip mobile443`, которую не трогают ни Docker, ни UFW:
+
+- правила применяются **одной атомарной транзакцией** `nft -f`: если
+  что-то не применилось, старые правила остаются в силе (раньше набор
+  правил собирался по одной команде и мог остаться в полусобранном виде)
+- вход в фильтр — свои hook-цепочки с `priority -10`, то есть **раньше**
+  цепочек Docker и UFW. Костыли с `DOCKER-USER` больше не нужны: Docker
+  физически не может «перекрыть» наши правила своими
+- в hook `forward` порт назначения матчится **до DNAT**
+  (`ct original proto-dst`), поэтому проброс портов вида `10443:443`
+  фильтруется корректно
+- списки грузятся в nft-наборы с `flags interval` + `auto-merge`
+  (объединение перекрывающихся сетей), блокировки монитора — в набор с
+  `flags timeout` и **переживают пересборку правил**
+- лимит LOG-строк — per-IP (`dynamic`-набор), один активный поток больше
+  не «съедает» бюджет логирования остальных
+
+При обновлении старые `iptables`-цепочки (`FILTER_MOBILE_443`,
+`TRAF_GUARD_PRECHECK`) и `ipset`-наборы автоматически вычищаются.
+
+### 📵 Работа без логов xray (immediate-режим)
+
+Персональные Telegram-уведомления пользователю требуют `xray access.log`:
+соединение пропускается до xray, monitor находит по IP email пользователя
+и только потом блокирует. **Если логи xray отключены, блокировать было
+нечем — и Wi-Fi-подключения проходили свободно.**
+
+Теперь режим выбирается автоматически:
+
+| Режим | Когда включается | Как блокирует |
+|---|---|---|
+| `immediate` | логи xray отключены (`XRAY_ACCESS_LOG` пуст) или Telegram не настроен | немобильные IP дропаются **сразу** в nftables |
+| `deferred` | Telegram настроен **и** указан путь к `access.log` | первое соединение пропускается до xray, monitor опознаёт пользователя, блокирует IP и шлёт уведомление |
+
+Установщик и консоль теперь прямо спрашивают, включено ли логирование
+xray, и не заставляют выдумывать путь к несуществующему файлу. В
+`immediate`-режиме продолжают работать админ-алерты Traffic Guard и
+статистика. Текущий режим виден в `sudo mobile443` → «Статус и
+диагностика».
+
+### 🩹 Прочие исправления «фильтр стоит, а не блокирует»
+
+- **Monitor больше не оставляет фильтр открытым.** В `deferred`-режиме он
+  отказывался блокировать IP, если не нашёл его в `access.log` — то есть при
+  зондах без аутентификации, xray без `email` в логе или запоздавшей записи
+  не блокировалось ничего. Теперь такой IP блокируется на 10 минут без
+  уведомления (fail-closed), опознанный — на час с уведомлением
+- **Настройка Telegram через консоль перезапускает monitor.** Раньше
+  `enable --now` на уже запущенном сервисе ничего не делал, и monitor
+  продолжал жить со старым конфигом (`ENABLE_TELEGRAM=false`) — т.е. так
+  и не начинал блокировать
+- **Monitor обрабатывает события параллельно** (с лимитом и дедупликацией
+  по IP): раньше очередь стояла из-за `sleep`/`curl` в обработчиках, и при
+  потоке событий блокировка отставала на минуты
+- **Путь к `xray access.log` валидируется** при установке и в консоли, а
+  monitor при старте предупреждает (и шлёт alert админу), если указанный
+  лог недоступен — раньше идентификация молча отключалась навсегда
 
 ## ✨ Что изменилось в v0.5
 
@@ -96,45 +162,65 @@
 
 ## 🧠 Как работает фильтрация
 
-Используются:
+Всё живёт в одной таблице `ip mobile443`:
 
-- `ipset manual_allow_443`
-- `ipset traf_guard_government`
-- `ipset traf_guard_antiscanner`
-- `ipset allowed_mobile_443`
-- `chain TRAF_GUARD_PRECHECK`
-- `chain FILTER_MOBILE_443`
+| Объект | Назначение |
+|---|---|
+| `set manual_allow` | ручной allow-лист (всегда `accept`) |
+| `set mobile_allow` | мобильный allowlist из ASN |
+| `set tg_government` | traffic-guard: госсети |
+| `set tg_antiscanner` | traffic-guard: сканеры |
+| `set deferred_block` | блокировки от монитора (с таймаутом) |
+| `set log_limit` | per-IP лимит LOG-строк |
+| `chain prefilter_input` | hook `input`, priority `-10` |
+| `chain prefilter_forward` | hook `forward`, priority `-10` (матч порта до DNAT) |
+| `chain filter443` | сама логика фильтрации |
 
-### Полный режим
+### Полный режим (`immediate` — логи xray отключены)
 
 ```text
-INPUT/FORWARD/DOCKER-USER -> FILTER_MOBILE_443
-FILTER_MOBILE_443: manual_allow_443 -> ACCEPT
-FILTER_MOBILE_443 -> TRAF_GUARD_PRECHECK
-TRAF_GUARD_PRECHECK: traf_guard_government -> DROP
-TRAF_GUARD_PRECHECK: traf_guard_antiscanner -> DROP
-FILTER_MOBILE_443: allowed_mobile_443 -> ACCEPT
-FILTER_MOBILE_443: LOG
-FILTER_MOBILE_443: DROP
+prefilter_input:   tcp/udp dport {порты}            -> jump filter443
+prefilter_forward: ct original proto-dst {порты}    -> jump filter443
+filter443: ip saddr @manual_allow    -> accept
+filter443: ip saddr @tg_government   -> log + drop
+filter443: ip saddr @tg_antiscanner  -> log + drop
+filter443: ip saddr @mobile_allow    -> accept
+filter443:                              log + drop
 ```
 
 Иными словами:
 
-- если IP в `manual_allow.conf` -> `ACCEPT` сразу, минуя всё остальное
-- если IP в `government_networks.list` -> `DROP`
-- если IP в `antiscanner.list` -> `DROP`
-- иначе если IP входит в мобильный allowlist -> `ACCEPT`
-- иначе -> `DROP`
+- если IP в `manual_allow.conf` -> `accept` сразу, минуя всё остальное
+- если IP в `government_networks.list` -> `drop`
+- если IP в `antiscanner.list` -> `drop`
+- иначе если IP входит в мобильный allowlist -> `accept`
+- иначе -> `drop`
+
+### Полный режим (`deferred` — Telegram + доступный access.log)
+
+```text
+filter443: ip saddr @manual_allow    -> accept
+filter443: ip saddr @tg_government   -> log + drop
+filter443: ip saddr @tg_antiscanner  -> log + drop
+filter443: ip saddr @mobile_allow    -> accept
+filter443: ip saddr @deferred_block  -> drop
+filter443:                              log + accept   # monitor опознает и заблокирует
+```
+
+Последнее правило пропускает **первое** соединение до xray, чтобы monitor
+успел найти пользователя в `access.log` и отправить ему уведомление; сразу
+после этого IP уезжает в `deferred_block` и следующие соединения дропаются.
+Если пользователя опознать не удалось — IP всё равно блокируется
+(на 10 минут вместо часа), фильтр не остаётся открытым.
 
 ### Block-only режим
 
 ```text
-INPUT/FORWARD/DOCKER-USER -> FILTER_MOBILE_443
-FILTER_MOBILE_443: manual_allow_443 -> ACCEPT
-FILTER_MOBILE_443 -> TRAF_GUARD_PRECHECK
-TRAF_GUARD_PRECHECK: traf_guard_government -> DROP
-TRAF_GUARD_PRECHECK: traf_guard_antiscanner -> DROP
-FILTER_MOBILE_443: RETURN
+prefilter_input/forward -> jump filter443
+filter443: ip saddr @manual_allow    -> accept
+filter443: ip saddr @tg_government   -> log + drop
+filter443: ip saddr @tg_antiscanner  -> log + drop
+filter443:                              (конец цепочки, трафик проходит)
 ```
 
 Здесь режутся только IP из blocklist, а остальной трафик не ломается.
@@ -169,7 +255,8 @@ FILTER_MOBILE_443: RETURN
 - проходят базовую проверку CIDR
 - не падают на единичных битых строках
 - обновляются атомарно
-- загружаются в `ipset` через временные наборы и `ipset swap`
+- загружаются в nft-наборы одной транзакцией `nft -f` (при ошибке
+  остаются прежние правила)
 
 ## 🧬 ASN, точечные сети и исключения
 
@@ -191,14 +278,14 @@ Mobile-allowlist строится не только из ASN. Есть пять 
 2. Подмешать сети из static_networks.conf
 3. Отсортировать и отфильтровать по формату CIDR
 4. Вычесть сети, попадающие под excluded_networks.conf
-5. Загрузить результат в ipset allowed_mobile_443
+5. Загрузить результат в nft-набор mobile_allow
 ```
 
 `manual_allow.conf` в этот пайплайн не входит — он живёт в отдельном
-ipset `manual_allow_443` и проверяется первым правилом в цепочке
-`FILTER_MOBILE_443`, до `TRAF_GUARD_PRECHECK` и до `allowed_mobile_443`.
-Поэтому вычитание через `excluded_networks.conf` на него не действует —
-это осознанный «пропуск несмотря ни на что» для доверенных адресов.
+наборе `manual_allow` и проверяется первым правилом цепочки `filter443`,
+до traf_guard-наборов и до `mobile_allow`. Поэтому вычитание через
+`excluded_networks.conf` на него не действует — это осознанный «пропуск
+несмотря ни на что» для доверенных адресов.
 
 ### Почему AS12389 (Ростелеком) исключён
 
@@ -253,7 +340,9 @@ bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/r
   - адрес панели Remnawave
   - API токен панели
   - источник Telegram ID
-  - путь к `xray access.log`
+  - **включено ли логирование xray**; если да — путь к `access.log`,
+    если нет — фильтр работает в `immediate`-режиме (блокировка сразу,
+    без персональных уведомлений)
 
 Обновление существующей установки:
 
@@ -299,11 +388,15 @@ bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/r
 
 Здесь тоже используется безопасный путь: `backup -> remove -> reinstall`.
 
-### 📝 3. Включение логов на ноде
+### 📝 3. Включение логов на ноде (только для персональных уведомлений)
 
-> **Важно:** Если у вас включены уведомления для пользователей, необходимо обязательно настроить логирование на вашей ноде.
+> **Важно:** Логи нужны **только** если вы хотите, чтобы бот писал
+> пользователю о блокировке. Сама фильтрация от логов не зависит: без них
+> фильтр работает в `immediate`-режиме и блокирует немобильные IP сразу.
+> Если логи xray выключены — просто ответьте «n» на вопрос установщика,
+> путь придумывать не нужно.
 
-Для этого выполните два простых шага:
+Для включения логов выполните два простых шага:
 
 **Шаг 1: Обновление `docker-compose.yml`**
 Добавьте следующий маппинг томов в конфигурацию вашей ноды:
@@ -338,14 +431,24 @@ bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/r
 
 ### Как определяется пользователь
 
-1. `iptables` логирует немобильное подключение
+Работает только в `deferred`-режиме (Telegram настроен **и** указан путь
+к `access.log`):
+
+1. `nftables` логирует немобильное подключение
 2. соединение кратковременно пропускается до `xray`, чтобы запись успела появиться в `access.log`
 3. по IP ищется пользователь в `xray access.log`
 4. из лога берётся `email` / ID пользователя
-5. IP добавляется во временный `deferred block`
+5. IP добавляется во временный `deferred_block` (на 1 час)
 6. по ID идёт запрос в Remnawave API
 7. из ответа берётся Telegram ID
 8. пользователю уходит уведомление о блокировке
+
+⚠️ Если пользователя определить **не удалось** (xray не пишет `email`,
+зонд/сканер без аутентификации, запись в логе запоздала) — IP всё равно
+блокируется, но на 10 минут и без уведомления (fail-closed).
+
+Если логи xray отключены совсем, этот механизм не используется: фильтр
+работает в `immediate`-режиме и блокирует немобильные IP сразу.
 
 ### Что получает админ
 
@@ -362,7 +465,9 @@ mobile allowlist, размер traffic-guard списков — **собирае
 - `government_networks.list`
 - `antiscanner.list`
 
-Для таких событий используются отдельные лог-префиксы в `iptables`, а бот шлёт уведомление с IP, портом и причиной блокировки.
+Для таких событий используются отдельные лог-префиксы в правилах
+`nftables`, а бот шлёт уведомление с IP, портом и причиной блокировки.
+Админ-алерты работают в обоих режимах, включая `immediate`.
 
 ## 🕛 Автообновление
 
@@ -379,8 +484,8 @@ mobile allowlist, размер traffic-guard списков — **собирае
 - `government_networks.list`
 - `antiscanner.list`
 - mobile ASN allowlist, если он включён
-- пересборка `ipset`
-- приведение `iptables` chain к нужному виду без дублей
+- пересборка nft-наборов и правил одной атомарной транзакцией
+  (блокировки в `deferred_block` при этом сохраняются)
 
 Дополнительно всегда ставится `mobile443-monitor.service` — он считает
 заблокированные соединения и топ IP в `stats_blocked.txt` независимо от
@@ -446,10 +551,11 @@ sudo mobile443
    ASN. Для одного IP используйте `/32`. После изменения сразу
    перезапускает `mobile443-apply.service`, чтобы применить без ожидания
    таймера.
-5. **Статус и диагностика** — сводка по конфигу, размерам ASN/сетевых
-   пулов, счётчикам `ipset`, правилам `iptables` и статусам systemd-юнитов
-   в одном экране (то же самое, что раньше приходилось собирать вручную
-   командами из раздела «🔍 Команды проверки» ниже).
+5. **Статус и диагностика** — сводка по конфигу, текущему режиму
+   блокировки (`immediate`/`deferred`), размерам ASN/сетевых пулов,
+   наполнению nft-наборов, правилам с счётчиками пакетов и статусам
+   systemd-юнитов в одном экране (то же самое, что раньше приходилось
+   собирать вручную командами из раздела «🔍 Команды проверки» ниже).
 6. **Статистика (как отправляет бот)** — блокировки, уникальные IP, топ
    IP и размеры списков собираются всегда, через `mobile443-monitor.service`,
    независимо от того, настроен ли Telegram. Пункт меню показывает эти
@@ -459,13 +565,14 @@ sudo mobile443
 7. **Настроить Telegram / Remnawave** — если при установке интеграция не
    была включена (или её нужно перенастроить), этот пункт задаёт те же
    вопросы, что и `install.sh` (токен бота, admin ID, панель Remnawave,
-   API токен, источник Telegram ID, кастомное сообщение, путь к
-   `access.log`), сохраняет их в `config.conf` и разворачивает
-   `mobile443-monitor.service` / `mobile443-stats.timer` без полной
-   переустановки.
+   API токен, источник Telegram ID, кастомное сообщение, включены ли логи
+   xray и путь к `access.log`), сохраняет их в `config.conf`,
+   разворачивает `mobile443-monitor.service` / `mobile443-stats.timer` и
+   перезапускает монитор, чтобы он подхватил новый конфиг.
 8. **Удалить mobile443** — то же самое, что `install.sh remove`, только
-   офлайн и без повторного скачивания скрипта: снимает `iptables`/`ipset`,
-   останавливает и удаляет systemd-юниты, чистит `/opt/mobile443` и
+   офлайн и без повторного скачивания скрипта: удаляет таблицу
+   `ip mobile443` (плюс legacy-правила `iptables`/`ipset` от версий до
+   v0.7), останавливает и удаляет systemd-юниты, чистит `/opt/mobile443` и
    `/var/lib/mobile443`, и в конце удаляет саму консоль.
 
 ## 🧾 Конфиг
@@ -485,6 +592,9 @@ ENABLE_TELEGRAM="true|false"
 TG_ID_SOURCE="telegramId|username|username_custom"
 TG_CUSTOM_MESSAGE="..."
 TG_USERNAME_SEPARATOR="_|:|-|..."
+# Пусто = логи xray отключены = immediate-режим (блокировка сразу).
+# Заполнено + ENABLE_TELEGRAM=true = deferred-режим с уведомлениями.
+XRAY_ACCESS_LOG="/var/log/remnanode/access.log"
 PORTS="443 8443"
 TRAF_GUARD_BASE_URL="..."
 GOV_LIST_URL="..."
@@ -513,22 +623,31 @@ ENABLE_TELEGRAM="false"
 
 ## 🔍 Команды проверки
 
-### Iptables
+### Правила nftables
 
 ```bash
-iptables-save | grep -E 'FILTER_MOBILE_443|TRAF_GUARD_PRECHECK|allowed_mobile_443|traf_guard_'
-iptables -L TRAF_GUARD_PRECHECK -n -v --line-numbers
-iptables -L FILTER_MOBILE_443 -n -v --line-numbers
+nft list table ip mobile443
 ```
 
-### Ipset
+Счётчики пакетов по правилам (главная проверка «работает ли фильтр»):
 
 ```bash
-ipset list traf_guard_government | head -20
-ipset list traf_guard_antiscanner | head -20
-ipset list allowed_mobile_443 | head -20
-ipset list manual_allow_443 | head -20
-ipset list mobile443_deferred_block | head -20
+nft list chain ip mobile443 filter443
+```
+
+### Наборы
+
+```bash
+nft list set ip mobile443 mobile_allow | head -20
+nft list set ip mobile443 tg_government | head -20
+nft list set ip mobile443 manual_allow
+nft list set ip mobile443 deferred_block
+```
+
+Проверить, попадает ли конкретный IP в набор:
+
+```bash
+nft get element ip mobile443 mobile_allow { 203.0.113.7 }
 ```
 
 ### Systemd
@@ -568,12 +687,14 @@ bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/r
 
 Удаляются только сущности проекта:
 
-- `FILTER_MOBILE_443`
-- `TRAF_GUARD_PRECHECK`
-- ipset проекта
+- таблица `ip mobile443` целиком (все её цепочки и наборы)
+- legacy `FILTER_MOBILE_443` / `TRAF_GUARD_PRECHECK` и ipset от версий до v0.7
 - systemd unit проекта
 - `/opt/mobile443`
 - `/var/lib/mobile443`
+
+Правила других инструментов (Docker, UFW, ваши собственные) не трогаются —
+фильтр живёт в своей таблице и удаляется вместе с ней.
 
 ## 📁 Основные файлы
 
@@ -587,6 +708,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/r
 /opt/mobile443/lists/government_networks.list
 /opt/mobile443/lists/antiscanner.list
 /var/lib/mobile443/prefixes.txt
+/var/lib/mobile443/ruleset.nft
 /usr/local/sbin/mobile443
 /usr/local/sbin/mobile443-common.sh
 /usr/local/sbin/mobile443-update.sh

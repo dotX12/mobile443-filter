@@ -50,6 +50,28 @@ default_ports_from_existing() {
   echo "$DEFAULT_PORTS"
 }
 
+# Проверяет введённый вручную путь к access.log. Файла может ещё не быть,
+# но тогда пользователь должен явно это подтвердить: без access.log
+# идентификация не работает и немобильные IP блокируются без уведомлений.
+confirm_xray_log_path() {
+  local path="$1" use_anyway
+
+  if [[ -z "$path" ]]; then
+    echo "   ⚠️  Путь не задан: пользователи не будут идентифицироваться,"
+    echo "      немобильные IP будут блокироваться без Telegram-уведомлений."
+    return 0
+  fi
+  if [[ -f "$path" ]]; then
+    return 0
+  fi
+
+  echo "   ✖ Файл не найден: $path"
+  echo "     Пока файла нет, идентификация не работает и немобильные IP"
+  echo "     блокируются без Telegram-уведомлений."
+  read -r -p "   Использовать этот путь всё равно? (y/n): " use_anyway < /dev/tty
+  [[ "${use_anyway,,}" == "y" ]]
+}
+
 detect_xray_log() {
   echo "🔍 Поиск access.log от xray/remnanode..."
 
@@ -83,15 +105,21 @@ detect_xray_log() {
     done
     echo ""
     echo "   Введите путь или Enter для первого найденного:"
-    read -r -p "   > " user_path < /dev/tty
-    XRAY_ACCESS_LOG="${user_path:-$(echo "$found" | head -1)}"
-    echo "   ✅ Используем: $XRAY_ACCESS_LOG"
+    while true; do
+      read -r -p "   > " user_path < /dev/tty
+      XRAY_ACCESS_LOG="${user_path:-$(echo "$found" | head -1)}"
+      confirm_xray_log_path "$XRAY_ACCESS_LOG" && break
+    done
+    echo "   ✅ Используем: ${XRAY_ACCESS_LOG:-не задан}"
     return
   fi
 
   echo "   ⚠️  Автоматически не найден."
-  echo "   Введите полный путь к access.log xray:"
-  read -r -p "   > " XRAY_ACCESS_LOG < /dev/tty
+  echo "   Введите полный путь к access.log xray (Enter — пропустить):"
+  while true; do
+    read -r -p "   > " XRAY_ACCESS_LOG < /dev/tty
+    confirm_xray_log_path "$XRAY_ACCESS_LOG" && break
+  done
 }
 
 write_config() {
@@ -142,7 +170,7 @@ EOF
 interactive_setup_full() {
   local ports tg_choice enable_telegram tg_bot_token tg_admin_id
   local remnawave_api_url remnawave_api_token tg_id_source tg_username_separator
-  local xray_access_log
+  local xray_access_log xray_logs_choice
 
   echo ""
   echo "╔═══════════════════════════════════════════════╗"
@@ -228,8 +256,22 @@ interactive_setup_full() {
     fi
     echo ""
 
-    detect_xray_log
-    xray_access_log="${XRAY_ACCESS_LOG:-}"
+    echo "📝 Персональные уведомления пользователям работают через xray access.log:"
+    echo "   соединение сначала пропускается до xray, monitor находит по IP email"
+    echo "   пользователя в логе, блокирует IP и шлёт ему уведомление."
+    echo "   Если логи xray ОТКЛЮЧЕНЫ — уведомления пользователям невозможны,"
+    echo "   и немобильные IP будут блокироваться сразу на уровне nftables."
+    echo "   Админ-алерты Traffic Guard и статистика работают в любом случае."
+    echo ""
+    echo "   Включено ли у вас логирование xray (access.log)? (y/n)"
+    read -r -p "   > " xray_logs_choice < /dev/tty
+    if [[ "${xray_logs_choice,,}" == "y" ]]; then
+      detect_xray_log
+      xray_access_log="${XRAY_ACCESS_LOG:-}"
+    else
+      xray_access_log=""
+      echo "   ✅ Логи отключены: режим immediate — блокировка сразу в nftables."
+    fi
   else
     enable_telegram="false"
     tg_bot_token=""
@@ -552,7 +594,7 @@ strip_legacy_rostelecom_from_asns() {
 }
 
 install_packages() {
-  local -a packages=(curl ipset iptables util-linux ca-certificates)
+  local -a packages=(curl nftables util-linux ca-certificates)
 
   if [[ "$INSTALL_PROFILE" == "full" ]]; then
     packages+=(jq)
@@ -639,6 +681,18 @@ normalize_restored_config() {
   tg_custom_message="${TG_CUSTOM_MESSAGE:-}"
   tg_username_separator="${TG_USERNAME_SEPARATOR:-}"
 
+  # Путь к access.log остался с прошлой установки, но файла нет (логи xray
+  # выключены или путь неверный) — чистим его, чтобы фильтр работал в
+  # immediate-режиме и блокировал сразу, а не ждал идентификации, которая
+  # никогда не произойдёт. Вернуть можно через консоль (пункт Telegram).
+  if [[ -n "$xray_access_log" && ! -f "$xray_access_log" ]]; then
+    echo "[*] xray access.log не найден: ${xray_access_log}"
+    echo "    Переключаемся в immediate-режим — немобильные IP будут"
+    echo "    блокироваться сразу. Путь можно задать заново:"
+    echo "    sudo mobile443 -> \"Настроить Telegram / Remnawave\""
+    xray_access_log=""
+  fi
+
   if [[ "$target_profile" == "block-only" ]]; then
     enable_traf_guard="true"
     enable_mobile_allow="false"
@@ -724,19 +778,24 @@ EXCLUDED_NETWORKS_FILE="${BASE_DIR}/excluded_networks.conf"
 MANUAL_ALLOW_FILE="${BASE_DIR}/manual_allow.conf"
 ALLOW_CACHE_FILE="${STATE_DIR}/prefixes.txt"
 LOCK_FILE="${STATE_DIR}/lock"
+RULESET_FILE="${STATE_DIR}/ruleset.nft"
 
-IPSET_ALLOW_NAME="allowed_mobile_443"
-IPSET_ALLOW_TMP_NAME="${IPSET_ALLOW_NAME}_tmp"
-IPSET_GOV_NAME="traf_guard_government"
-IPSET_GOV_TMP_NAME="${IPSET_GOV_NAME}_tmp"
-IPSET_ANTISCANNER_NAME="traf_guard_antiscanner"
-IPSET_ANTISCANNER_TMP_NAME="${IPSET_ANTISCANNER_NAME}_tmp"
-IPSET_DEFERRED_BLOCK_NAME="mobile443_deferred_block"
-IPSET_MANUAL_ALLOW_NAME="manual_allow_443"
-IPSET_MANUAL_ALLOW_TMP_NAME="${IPSET_MANUAL_ALLOW_NAME}_tmp"
+# Вся фильтрация живёт в собственной nftables-таблице `ip mobile443`:
+# её не трогают ни Docker, ни UFW, правила применяются атомарно через
+# `nft -f` (если транзакция не прошла — прежние правила остаются),
+# а hook forward матчит порт назначения ДО DNAT (ct original proto-dst),
+# так что проброс портов в Docker bridge больше не проблема.
+NFT_TABLE="mobile443"
+SET_MANUAL_ALLOW="manual_allow"
+SET_MOBILE_ALLOW="mobile_allow"
+SET_GOV="tg_government"
+SET_ANTISCANNER="tg_antiscanner"
+SET_DEFERRED="deferred_block"
+SET_LOG_LIMIT="log_limit"
+CHAIN_INPUT="prefilter_input"
+CHAIN_FORWARD="prefilter_forward"
+CHAIN_FILTER="filter443"
 
-PRECHECK_CHAIN="TRAF_GUARD_PRECHECK"
-CHAIN_NAME="FILTER_MOBILE_443"
 LOG_PREFIX="MOBILE443_BLOCK: "
 GOV_LOG_PREFIX="MOBILE443_TG_GOV: "
 ANTISCANNER_LOG_PREFIX="MOBILE443_TG_SCAN: "
@@ -779,8 +838,7 @@ bool_is_true() {
 
 ensure_deps() {
   need_cmd curl
-  need_cmd ipset
-  need_cmd iptables
+  need_cmd nft
   need_cmd flock
   if bool_is_true "$ENABLE_MOBILE_ALLOW"; then
     need_cmd jq
@@ -791,33 +849,35 @@ ensure_dirs() {
   mkdir -p "$BASE_DIR" "$STATE_DIR" "$LISTS_DIR"
 }
 
-ensure_set_pair() {
-  local set_name="$1"
-  local tmp_name="$2"
-  ipset create "$set_name" hash:net family inet hashsize 65536 maxelem 524288 -exist
-  ipset create "$tmp_name" hash:net family inet hashsize 65536 maxelem 524288 -exist
+# Режим deferred (пропустить первое соединение до xray, чтобы monitor нашёл
+# пользователя в access.log, заблокировал и уведомил) возможен только когда
+# включены Telegram-уведомления И задан путь к access.log. Если логи xray
+# отключены (XRAY_ACCESS_LOG пуст) — идентифицировать пользователя нечем,
+# и немобильные IP блокируются сразу на уровне nftables (immediate).
+deferred_mode_enabled() {
+  bool_is_true "$ENABLE_TELEGRAM" \
+    && bool_is_true "$ENABLE_MOBILE_ALLOW" \
+    && [[ -n "${XRAY_ACCESS_LOG:-}" ]]
 }
 
-ensure_ipsets() {
-  ensure_set_pair "$IPSET_MANUAL_ALLOW_NAME" "$IPSET_MANUAL_ALLOW_TMP_NAME"
-  if bool_is_true "$ENABLE_TRAF_GUARD"; then
-    if bool_is_true "$ENABLE_TRAF_GUARD_GOVERNMENT"; then
-      ensure_set_pair "$IPSET_GOV_NAME" "$IPSET_GOV_TMP_NAME"
-    fi
-    if bool_is_true "$ENABLE_TRAF_GUARD_ANTISCANNER"; then
-      ensure_set_pair "$IPSET_ANTISCANNER_NAME" "$IPSET_ANTISCANNER_TMP_NAME"
-    fi
-  fi
-  if bool_is_true "$ENABLE_MOBILE_ALLOW"; then
-    ensure_set_pair "$IPSET_ALLOW_NAME" "$IPSET_ALLOW_TMP_NAME"
-  fi
-  if bool_is_true "$ENABLE_TELEGRAM"; then
-    ipset create "$IPSET_DEFERRED_BLOCK_NAME" hash:ip family inet hashsize 4096 maxelem 65536 timeout 3600 -exist
-  fi
+# Идемпотентный скелет (таблица + deferred-набор) — для monitor, который
+# может стартовать раньше полного применения правил.
+ensure_nft_skeleton() {
+  nft -f - <<NFTSKEL
+add table ip ${NFT_TABLE}
+add set ip ${NFT_TABLE} ${SET_DEFERRED} { type ipv4_addr; flags timeout; }
+NFTSKEL
 }
 
-destroy_set_if_exists() {
-  ipset destroy "$1" 2>/dev/null || true
+# Число элементов набора — для статуса/статистики. Считаем записи,
+# разделённые запятыми (одна запись — CIDR либо диапазон a.b.c.d-e.f.g.h,
+# который auto-merge создаёт для сетей вне границ CIDR).
+nft_set_count() {
+  nft list set ip "$NFT_TABLE" "$1" 2>/dev/null \
+    | sed -n '/elements = {/,/}/p' \
+    | tr ',' '\n' \
+    | grep -cE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
+    | tr -d ' '
 }
 
 count_lines() {
@@ -914,27 +974,22 @@ filter_excluded_networks() {
   done < "$input"
 }
 
-# Ручной allow-лист — читается напрямую из manual_allow.conf (не кешируется,
-# файл уже локальный) и грузится в отдельный ipset, независимо от того,
-# включён ли mobile allowlist или traffic-guard.
-sync_manual_allow() {
-  local tmp line
-  tmp="$(mktemp)"
+# Ручной allow-лист: manual_allow.conf -> валидированный список CIDR
+# (по одному в строке). Применяется при каждой пересборке правил.
+build_manual_allow_file() {
+  local out="$1" line
+  : > "$out"
+  [[ -f "$MANUAL_ALLOW_FILE" ]] || return 0
 
-  if [[ -f "$MANUAL_ALLOW_FILE" ]]; then
-    while IFS= read -r line || [[ -n "$line" ]]; do
-      line="$(echo "$line" | sed 's/[[:space:]]*#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//')"
-      [[ -n "$line" ]] || continue
-      validate_ipv4_cidr "$line" || {
-        log "WARN manual_allow: skip invalid entry '${line}'"
-        continue
-      }
-      echo "$line" >> "$tmp"
-    done < "$MANUAL_ALLOW_FILE"
-  fi
-
-  rebuild_ipset_from_file "$IPSET_MANUAL_ALLOW_NAME" "$IPSET_MANUAL_ALLOW_TMP_NAME" "$tmp" "manual allow" || true
-  rm -f "$tmp"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(echo "$line" | sed 's/[[:space:]]*#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [[ -n "$line" ]] || continue
+    validate_ipv4_cidr "$line" || {
+      log "WARN manual_allow: skip invalid entry '${line}'"
+      continue
+    }
+    echo "$line" >> "$out"
+  done < "$MANUAL_ALLOW_FILE"
 }
 
 download_and_validate_list() {
@@ -994,110 +1049,133 @@ download_and_validate_list() {
   log "${label} entries: ${valid_count}"
 }
 
-rebuild_ipset_from_file() {
-  local target_set="$1"
-  local tmp_set="$2"
-  local file="$3"
-  local label="$4"
+# flush набора + заливка элементов из файла (по одному CIDR в строке),
+# порциями по 500 элементов на строку. Пишется в stdout как часть
+# транзакции nft -f.
+emit_set_refill() {
+  local set_name="$1" file="$2"
+  local -a batch=()
+  local line joined
 
-  [[ -f "$file" ]] || {
-    log "WARN ${label}: file not found: ${file}"
-    return 1
-  }
+  echo "flush set ip ${NFT_TABLE} ${set_name}"
+  [[ -s "$file" ]] || return 0
 
-  ipset flush "$tmp_set"
-  while IFS= read -r prefix || [[ -n "$prefix" ]]; do
-    [[ -n "$prefix" ]] || continue
-    ipset add "$tmp_set" "$prefix" -exist
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] || continue
+    batch+=("$line")
+    if (( ${#batch[@]} >= 500 )); then
+      printf -v joined '%s, ' "${batch[@]}"
+      echo "add element ip ${NFT_TABLE} ${set_name} { ${joined%, } }"
+      batch=()
+    fi
   done < "$file"
 
-  ipset swap "$tmp_set" "$target_set"
-  ipset flush "$tmp_set"
-  log "${label} loaded into ${target_set}"
-}
-
-delete_jump_if_exists() {
-  local chain="$1"
-  local proto="$2"
-  local port="$3"
-
-  while iptables -C "$chain" -p "$proto" --dport "$port" -j "$CHAIN_NAME" 2>/dev/null; do
-    iptables -D "$chain" -p "$proto" --dport "$port" -j "$CHAIN_NAME"
-  done
-}
-
-prepare_chains() {
-  iptables -N "$PRECHECK_CHAIN" 2>/dev/null || true
-  iptables -F "$PRECHECK_CHAIN"
-
-  if bool_is_true "$ENABLE_TRAF_GUARD"; then
-    if bool_is_true "$ENABLE_TRAF_GUARD_GOVERNMENT"; then
-      iptables -A "$PRECHECK_CHAIN" -m set --match-set "$IPSET_GOV_NAME" src \
-        -m limit --limit 30/min --limit-burst 10 \
-        -j LOG --log-prefix "$GOV_LOG_PREFIX" --log-level 4
-      iptables -A "$PRECHECK_CHAIN" -m set --match-set "$IPSET_GOV_NAME" src -j DROP
-    fi
-    if bool_is_true "$ENABLE_TRAF_GUARD_ANTISCANNER"; then
-      iptables -A "$PRECHECK_CHAIN" -m set --match-set "$IPSET_ANTISCANNER_NAME" src \
-        -m limit --limit 30/min --limit-burst 10 \
-        -j LOG --log-prefix "$ANTISCANNER_LOG_PREFIX" --log-level 4
-      iptables -A "$PRECHECK_CHAIN" -m set --match-set "$IPSET_ANTISCANNER_NAME" src -j DROP
-    fi
-  fi
-
-  iptables -N "$CHAIN_NAME" 2>/dev/null || true
-  iptables -F "$CHAIN_NAME"
-  # Ручной allow-лист — ACCEPT раньше traf_guard-блоклистов и мобильного ASN.
-  iptables -A "$CHAIN_NAME" -m set --match-set "$IPSET_MANUAL_ALLOW_NAME" src -j ACCEPT
-  iptables -A "$CHAIN_NAME" -j "$PRECHECK_CHAIN"
-
-  if bool_is_true "$ENABLE_MOBILE_ALLOW"; then
-    # 1) ACCEPT mobile ASN IPs immediately
-    iptables -A "$CHAIN_NAME" -m set --match-set "$IPSET_ALLOW_NAME" src -j ACCEPT
-
-    if bool_is_true "$ENABLE_TELEGRAM"; then
-      # 2) DROP IPs that were already identified and deferred-blocked by the monitor
-      iptables -A "$CHAIN_NAME" -m set --match-set "$IPSET_DEFERRED_BLOCK_NAME" src -j DROP
-      # 3) LOG non-mobile IPs but let them through so xray can log the user email
-      iptables -A "$CHAIN_NAME" -m limit --limit 30/min --limit-burst 10 \
-        -j LOG --log-prefix "$LOG_PREFIX" --log-level 4
-      # No DROP here — connection passes to xray, monitor will add IP to deferred block
-    else
-      # Telegram disabled — immediate LOG + DROP as before
-      iptables -A "$CHAIN_NAME" -m limit --limit 30/min --limit-burst 10 \
-        -j LOG --log-prefix "$LOG_PREFIX" --log-level 4
-      iptables -A "$CHAIN_NAME" -j DROP
-    fi
-  else
-    iptables -A "$CHAIN_NAME" -j RETURN
+  if (( ${#batch[@]} > 0 )); then
+    printf -v joined '%s, ' "${batch[@]}"
+    echo "add element ip ${NFT_TABLE} ${set_name} { ${joined%, } }"
   fi
 }
 
-attach_chain() {
-  local chain port
+# Полный набор правил как ОДНА атомарная транзакция nft -f: если любая
+# часть не применится, прежние правила останутся нетронутыми. Содержимое
+# наборов берётся из локальных файлов (gov/antiscanner-листы, кеш
+# mobile-allowlist, manual_allow.conf). deferred_block не трогается —
+# блокировки монитора переживают пересборку.
+build_ruleset() {
+  local out="$1"
+  local ports manual_tmp
+  printf -v ports '%s, ' "${PORT_LIST[@]}"
+  ports="${ports%, }"
 
-  for port in "${PORT_LIST[@]}"; do
-    for chain in INPUT FORWARD; do
-      delete_jump_if_exists "$chain" tcp "$port"
-      delete_jump_if_exists "$chain" udp "$port"
-      iptables -I "$chain" 1 -p tcp --dport "$port" -j "$CHAIN_NAME"
-      iptables -I "$chain" 1 -p udp --dport "$port" -j "$CHAIN_NAME"
-    done
+  manual_tmp="$(mktemp)"
+  build_manual_allow_file "$manual_tmp"
 
-    if iptables -nL DOCKER-USER >/dev/null 2>&1; then
-      delete_jump_if_exists DOCKER-USER tcp "$port"
-      delete_jump_if_exists DOCKER-USER udp "$port"
-      iptables -I DOCKER-USER 1 -p tcp --dport "$port" -j "$CHAIN_NAME"
-      iptables -I DOCKER-USER 1 -p udp --dport "$port" -j "$CHAIN_NAME"
+  {
+    echo "add table ip ${NFT_TABLE}"
+    echo "add set ip ${NFT_TABLE} ${SET_MANUAL_ALLOW} { type ipv4_addr; flags interval; auto-merge; }"
+    echo "add set ip ${NFT_TABLE} ${SET_MOBILE_ALLOW} { type ipv4_addr; flags interval; auto-merge; }"
+    echo "add set ip ${NFT_TABLE} ${SET_GOV} { type ipv4_addr; flags interval; auto-merge; }"
+    echo "add set ip ${NFT_TABLE} ${SET_ANTISCANNER} { type ipv4_addr; flags interval; auto-merge; }"
+    echo "add set ip ${NFT_TABLE} ${SET_DEFERRED} { type ipv4_addr; flags timeout; }"
+    # per-IP лимит LOG-строк: один активный поток не съедает бюджет
+    # логирования других IP (в deferred-режиме блокировка начинается
+    # именно с LOG-строки)
+    echo "add set ip ${NFT_TABLE} ${SET_LOG_LIMIT} { type ipv4_addr; flags dynamic; timeout 2m; size 65536; }"
+    # priority -10: раньше цепочек Docker/UFW (priority 0). accept у нас
+    # не обходит их фильтры (в nftables пакет всё равно пройдёт остальные
+    # hook-цепочки), а drop — окончателен.
+    echo "add chain ip ${NFT_TABLE} ${CHAIN_INPUT} { type filter hook input priority -10; policy accept; }"
+    echo "add chain ip ${NFT_TABLE} ${CHAIN_FORWARD} { type filter hook forward priority -10; policy accept; }"
+    echo "add chain ip ${NFT_TABLE} ${CHAIN_FILTER}"
+    echo "flush chain ip ${NFT_TABLE} ${CHAIN_INPUT}"
+    echo "flush chain ip ${NFT_TABLE} ${CHAIN_FORWARD}"
+    echo "flush chain ip ${NFT_TABLE} ${CHAIN_FILTER}"
+
+    emit_set_refill "$SET_MANUAL_ALLOW" "$manual_tmp"
+
+    if bool_is_true "$ENABLE_TRAF_GUARD" && bool_is_true "$ENABLE_TRAF_GUARD_GOVERNMENT" && [[ -s "$GOV_LIST_FILE" ]]; then
+      emit_set_refill "$SET_GOV" "$GOV_LIST_FILE"
     fi
-  done
+    if bool_is_true "$ENABLE_TRAF_GUARD" && bool_is_true "$ENABLE_TRAF_GUARD_ANTISCANNER" && [[ -s "$ANTISCANNER_LIST_FILE" ]]; then
+      emit_set_refill "$SET_ANTISCANNER" "$ANTISCANNER_LIST_FILE"
+    fi
+    if bool_is_true "$ENABLE_MOBILE_ALLOW" && [[ -s "$ALLOW_CACHE_FILE" ]]; then
+      emit_set_refill "$SET_MOBILE_ALLOW" "$ALLOW_CACHE_FILE"
+    fi
+
+    # Входные точки: input — обычный dport (host-network/без NAT);
+    # forward — порт назначения ДО DNAT через conntrack, чтобы работал
+    # любой проброс портов в Docker bridge (hostPort != containerPort).
+    echo "add rule ip ${NFT_TABLE} ${CHAIN_INPUT} tcp dport { ${ports} } jump ${CHAIN_FILTER}"
+    echo "add rule ip ${NFT_TABLE} ${CHAIN_INPUT} udp dport { ${ports} } jump ${CHAIN_FILTER}"
+    echo "add rule ip ${NFT_TABLE} ${CHAIN_FORWARD} meta l4proto { tcp, udp } ct original proto-dst { ${ports} } jump ${CHAIN_FILTER}"
+
+    # Ручной allow-лист — accept раньше traf_guard-блоклистов и мобильного ASN.
+    echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} ip saddr @${SET_MANUAL_ALLOW} counter accept"
+
+    if bool_is_true "$ENABLE_TRAF_GUARD" && bool_is_true "$ENABLE_TRAF_GUARD_GOVERNMENT"; then
+      echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} ip saddr @${SET_GOV} update @${SET_LOG_LIMIT} { ip saddr limit rate 6/minute burst 8 packets } log prefix \"${GOV_LOG_PREFIX}\" level warn"
+      echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} ip saddr @${SET_GOV} counter drop"
+    fi
+    if bool_is_true "$ENABLE_TRAF_GUARD" && bool_is_true "$ENABLE_TRAF_GUARD_ANTISCANNER"; then
+      echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} ip saddr @${SET_ANTISCANNER} update @${SET_LOG_LIMIT} { ip saddr limit rate 6/minute burst 8 packets } log prefix \"${ANTISCANNER_LOG_PREFIX}\" level warn"
+      echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} ip saddr @${SET_ANTISCANNER} counter drop"
+    fi
+
+    if bool_is_true "$ENABLE_MOBILE_ALLOW"; then
+      echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} ip saddr @${SET_MOBILE_ALLOW} counter accept"
+
+      if deferred_mode_enabled; then
+        # deferred: уже заблокированные монитором IP — drop; остальные
+        # немобильные логируются и пропускаются до xray, чтобы monitor
+        # нашёл пользователя в access.log (fail-closed: заблокирует даже
+        # если не нашёл)
+        echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} ip saddr @${SET_DEFERRED} counter drop"
+        echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} update @${SET_LOG_LIMIT} { ip saddr limit rate 6/minute burst 8 packets } log prefix \"${LOG_PREFIX}\" level warn"
+        echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} counter accept"
+      else
+        # immediate: логи xray отключены или Telegram не настроен —
+        # блокируем сразу на уровне файрвола
+        echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} update @${SET_LOG_LIMIT} { ip saddr limit rate 6/minute burst 8 packets } log prefix \"${LOG_PREFIX}\" level warn"
+        echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} counter drop"
+      fi
+    fi
+    # block-only: после traf_guard-проверок конец цепочки = return,
+    # трафик проходит дальше (policy accept)
+  } > "$out"
+
+  rm -f "$manual_tmp"
 }
 
 apply_rules() {
   ensure_dirs
-  ensure_ipsets
-  prepare_chains
-  attach_chain
+  build_ruleset "$RULESET_FILE"
+  nft -f "$RULESET_FILE"
+  if deferred_mode_enabled; then
+    log "nftables: правила применены (таблица ip ${NFT_TABLE}, режим deferred)"
+  else
+    log "nftables: правила применены (таблица ip ${NFT_TABLE}, режим immediate)"
+  fi
 }
 
 send_tg() {
@@ -1184,7 +1262,6 @@ update_mobile_allowlist() {
     fi
   fi
 
-  rebuild_ipset_from_file "$IPSET_ALLOW_NAME" "$IPSET_ALLOW_TMP_NAME" "$TMP_CLEAN" "mobile allowlist"
   install -m 0644 "$TMP_CLEAN" "$ALLOW_CACHE_FILE"
   cleanup_tmp
   trap - EXIT
@@ -1199,23 +1276,20 @@ flock -n 9 || {
 
 ensure_deps
 ensure_dirs
-ensure_ipsets
-sync_manual_allow
 
 if bool_is_true "$ENABLE_TRAF_GUARD" && bool_is_true "$ENABLE_TRAF_GUARD_GOVERNMENT"; then
   download_and_validate_list "$GOV_LIST_URL" "$GOV_LIST_FILE" "government_networks" "${GOV_LIST_URL_FALLBACK:-}"
-  rebuild_ipset_from_file "$IPSET_GOV_NAME" "$IPSET_GOV_TMP_NAME" "$GOV_LIST_FILE" "government_networks"
 fi
 
 if bool_is_true "$ENABLE_TRAF_GUARD" && bool_is_true "$ENABLE_TRAF_GUARD_ANTISCANNER"; then
   download_and_validate_list "$ANTISCANNER_LIST_URL" "$ANTISCANNER_LIST_FILE" "antiscanner" "${ANTISCANNER_LIST_URL_FALLBACK:-}"
-  rebuild_ipset_from_file "$IPSET_ANTISCANNER_NAME" "$IPSET_ANTISCANNER_TMP_NAME" "$ANTISCANNER_LIST_FILE" "antiscanner"
 fi
 
 if bool_is_true "$ENABLE_MOBILE_ALLOW"; then
   update_mobile_allowlist
 fi
 
+# Всё скачанное лежит в локальных файлах — применяем одной nft-транзакцией
 apply_rules
 log "Update complete"
 EOF
@@ -1235,25 +1309,12 @@ flock -n 9 || {
 
 ensure_deps
 ensure_dirs
-ensure_ipsets
-sync_manual_allow
 
-if bool_is_true "$ENABLE_TRAF_GUARD" && bool_is_true "$ENABLE_TRAF_GUARD_GOVERNMENT"; then
-  rebuild_ipset_from_file "$IPSET_GOV_NAME" "$IPSET_GOV_TMP_NAME" "$GOV_LIST_FILE" "government_networks" || true
+if bool_is_true "$ENABLE_MOBILE_ALLOW" && [[ ! -s "$ALLOW_CACHE_FILE" ]]; then
+  log "WARN mobile allowlist cache not found: $ALLOW_CACHE_FILE (набор будет пуст до первого обновления)"
 fi
 
-if bool_is_true "$ENABLE_TRAF_GUARD" && bool_is_true "$ENABLE_TRAF_GUARD_ANTISCANNER"; then
-  rebuild_ipset_from_file "$IPSET_ANTISCANNER_NAME" "$IPSET_ANTISCANNER_TMP_NAME" "$ANTISCANNER_LIST_FILE" "antiscanner" || true
-fi
-
-if bool_is_true "$ENABLE_MOBILE_ALLOW"; then
-  if [[ -s "$ALLOW_CACHE_FILE" ]]; then
-    rebuild_ipset_from_file "$IPSET_ALLOW_NAME" "$IPSET_ALLOW_TMP_NAME" "$ALLOW_CACHE_FILE" "mobile allowlist"
-  else
-    log "WARN mobile allowlist cache not found: $ALLOW_CACHE_FILE"
-  fi
-fi
-
+# build_ruleset читает все списки из локальных файлов — сеть не нужна
 apply_rules
 log "Cache applied"
 EOF
@@ -1267,10 +1328,17 @@ source /usr/local/sbin/mobile443-common.sh
 NOTIFIED_FILE="${STATE_DIR}/notified.txt"
 STATS_BLOCKED_FILE="${STATE_DIR}/stats_blocked.txt"
 TG_ALERTS_FILE="${STATE_DIR}/tg_alerts.txt"
+INFLIGHT_DIR="${STATE_DIR}/inflight"
 NOTIFY_COOLDOWN=21600
 ADMIN_ALERT_COOLDOWN=1800
+DEFERRED_BLOCK_TIMEOUT=3600
+DEFERRED_BLOCK_UNIDENTIFIED_TIMEOUT=600
+MAX_PARALLEL_EVENTS=8
 
 mkdir -p "$STATE_DIR"
+# Маркеры "IP уже обрабатывается" от прошлого запуска больше не актуальны
+rm -rf "$INFLIGHT_DIR"
+mkdir -p "$INFLIGHT_DIR"
 touch "$NOTIFIED_FILE" "$STATS_BLOCKED_FILE" "$TG_ALERTS_FILE"
 
 should_notify() {
@@ -1374,14 +1442,21 @@ extract_tg_id() {
 
 add_to_deferred_block() {
   local ip="$1"
-  ipset add "$IPSET_DEFERRED_BLOCK_NAME" "$ip" timeout 3600 -exist 2>/dev/null || true
-  log "Added ${ip} to deferred block ipset for 1 hour"
+  local timeout="${2:-$DEFERRED_BLOCK_TIMEOUT}"
+  # nft add element падает, если элемент уже есть — сначала удаляем
+  # (заодно обновляется timeout существующей блокировки)
+  nft delete element ip "$NFT_TABLE" "$SET_DEFERRED" "{ ${ip} }" 2>/dev/null || true
+  if nft add element ip "$NFT_TABLE" "$SET_DEFERRED" "{ ${ip} timeout ${timeout}s }" 2>/dev/null; then
+    log "Added ${ip} to deferred block set for ${timeout}s"
+  else
+    log "WARN: failed to add ${ip} to nft set '${SET_DEFERRED}'"
+  fi
 }
 
 find_user_by_ip_with_retry() {
   local ip="$1"
   local retries=5
-  local delay=1
+  local delay=2
   local attempt email
 
   for (( attempt=1; attempt<=retries; attempt++ )); do
@@ -1399,22 +1474,37 @@ find_user_by_ip_with_retry() {
 process_blocked() {
   local src_ip="$1"
   local dst_port="$2"
-  local now_ts email api_response has_response tg_id msg
-
-  now_ts=$(date '+%F %T')
-  echo "${now_ts} ${src_ip} ${dst_port}" >> "$STATS_BLOCKED_FILE"
+  local email api_response has_response tg_id msg
 
   [[ "${ENABLE_TELEGRAM:-false}" == "true" ]] || return 0
 
-  # Wait for the IP to appear in xray access.log (connection is allowed through first)
-  email=$(find_user_by_ip_with_retry "$src_ip")
+  # immediate-режим (логи xray отключены): блокирует сам nftables,
+  # монитору здесь делать нечего — статистика уже записана
+  deferred_mode_enabled || return 0
+
+  # Событие из бэклога: IP уже заблокирован — повторная обработка не нужна
+  if nft get element ip "$NFT_TABLE" "$SET_DEFERRED" "{ ${src_ip} }" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  email=""
+  if [[ -n "${XRAY_ACCESS_LOG:-}" && -f "${XRAY_ACCESS_LOG:-}" ]]; then
+    # Wait for the IP to appear in xray access.log (connection is allowed through first)
+    email=$(find_user_by_ip_with_retry "$src_ip")
+  fi
+
   if [[ -z "$email" ]]; then
-    # Do not add to deferred block if NOT found. 
-    # This gives slow connections time to establish and appear in access.log on the next log trigger.
+    # Fail-closed: пользователя определить не удалось (нет access.log, xray
+    # не пишет email, зонд/сканер без аутентификации) — блокируем всё
+    # равно, иначе фильтр остаётся открытым для всех неопознанных IP.
+    # Таймаут короче обычного: если запись в логе просто запоздала, у
+    # клиента будет шанс идентифицироваться при следующей попытке.
+    add_to_deferred_block "$src_ip" "$DEFERRED_BLOCK_UNIDENTIFIED_TIMEOUT"
+    log "Blocked ${src_ip}:${dst_port} without identification (no email found, XRAY_ACCESS_LOG=${XRAY_ACCESS_LOG:-<not set>})"
     return
   fi
 
-  # Add IP to deferred block immediately after identifying the user
+  # Блокируем сразу после идентификации, до медленных запросов к API
   add_to_deferred_block "$src_ip"
 
   api_response=$(get_remnawave_user "$email")
@@ -1463,8 +1553,6 @@ process_traf_guard_alert() {
   local reason="$3"
   local key msg
 
-  echo "$(date '+%F %T') ${src_ip} ${dst_port} ${reason}" >> "$STATS_BLOCKED_FILE"
-
   [[ "${ENABLE_TELEGRAM:-false}" == "true" ]] || return 0
   [[ -n "${TG_ADMIN_ID:-}" ]] || return 0
 
@@ -1498,13 +1586,64 @@ get_log_stream() {
   fi
 }
 
+# Обработка события в фоне: очередь kernel-логов не должна стоять из-за
+# sleep'ов и curl'ов в обработчиках (иначе при потоке событий блокировка
+# отстаёт на минуты). На каждый IP — не больше одного обработчика
+# одновременно; число параллельных обработчиков ограничено.
+spawn_event_handler() {
+  local kind="$1" ip="$2" port="$3" reason="${4:-}"
+  local marker="${INFLIGHT_DIR}/${kind}${reason:+_${reason}}_${ip}"
+
+  # Статистика пишется для каждого события, независимо от Telegram
+  echo "$(date '+%F %T') ${ip} ${port}${reason:+ ${reason}}" >> "$STATS_BLOCKED_FILE"
+
+  [[ "${ENABLE_TELEGRAM:-false}" == "true" ]] || return 0
+
+  if ! mkdir "$marker" 2>/dev/null; then
+    return 0
+  fi
+
+  while (( $(jobs -rp | wc -l) >= MAX_PARALLEL_EVENTS )); do
+    wait -n || true
+  done
+
+  (
+    trap 'rmdir "$marker" 2>/dev/null || true' EXIT
+    if [[ "$kind" == "blocked" ]]; then
+      process_blocked "$ip" "$port" || true
+    else
+      process_traf_guard_alert "$ip" "$port" "$reason" || true
+    fi
+  ) &
+}
+
+ensure_dirs
+ensure_nft_skeleton
+
+if [[ "${ENABLE_TELEGRAM:-false}" == "true" ]]; then
+  if [[ -z "${XRAY_ACCESS_LOG:-}" ]]; then
+    log "Логи xray не настроены (XRAY_ACCESS_LOG пуст): персональные уведомления отключены,"
+    log "немобильные IP блокируются сразу на уровне nftables (immediate-режим)."
+    log "Админ-алерты Traffic Guard и статистика работают как обычно."
+  elif [[ ! -f "${XRAY_ACCESS_LOG}" ]]; then
+    log "WARN: XRAY_ACCESS_LOG='${XRAY_ACCESS_LOG}' задан, но файл не найден."
+    log "WARN: идентификация пользователей невозможна — IP блокируются без уведомлений (fail-closed)."
+    if [[ -n "${TG_ADMIN_ID:-}" ]]; then
+      send_tg "$TG_ADMIN_ID" "⚠️ <b>mobile443</b>: файл xray access.log (<code>${XRAY_ACCESS_LOG}</code>) не найден на сервере.
+
+Идентификация пользователей не работает — немобильные IP блокируются <b>без</b> Telegram-уведомлений.
+
+Проверьте путь XRAY_ACCESS_LOG в <code>/opt/mobile443/config.conf</code> и монтирование лога из контейнера ноды. Если логи xray отключены намеренно — очистите XRAY_ACCESS_LOG в конфиге, и фильтр перейдёт в immediate-режим без этого предупреждения."
+    fi
+  fi
+fi
+
 log "Monitor started, watching for blocked connections..."
 
 get_log_stream | while IFS= read -r line; do
   if [[ "$line" == *"$LOG_PREFIX"* || "$line" == *"$GOV_LOG_PREFIX"* || "$line" == *"$ANTISCANNER_LOG_PREFIX"* ]]; then
     src_ip=""
     dst_port=""
-    reason=""
 
     if [[ "$line" =~ SRC=([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
       src_ip="${BASH_REMATCH[1]}"
@@ -1516,13 +1655,11 @@ get_log_stream | while IFS= read -r line; do
 
     if [[ -n "$src_ip" && -n "$dst_port" ]]; then
       if [[ "$line" == *"$GOV_LOG_PREFIX"* ]]; then
-        reason="government_networks"
-        process_traf_guard_alert "$src_ip" "$dst_port" "$reason"
+        spawn_event_handler traf_guard "$src_ip" "$dst_port" "government_networks"
       elif [[ "$line" == *"$ANTISCANNER_LOG_PREFIX"* ]]; then
-        reason="antiscanner"
-        process_traf_guard_alert "$src_ip" "$dst_port" "$reason"
+        spawn_event_handler traf_guard "$src_ip" "$dst_port" "antiscanner"
       else
-        process_blocked "$src_ip" "$dst_port"
+        spawn_event_handler blocked "$src_ip" "$dst_port"
       fi
     fi
   fi
@@ -1550,9 +1687,9 @@ if [[ -f "$STATS_BLOCKED_FILE" && -s "$STATS_BLOCKED_FILE" ]]; then
   top_ips=$(awk '{print $3}' "$STATS_BLOCKED_FILE" | sort | uniq -c | sort -rn | head -10)
 fi
 
-allow_count=$(ipset list "$IPSET_ALLOW_NAME" 2>/dev/null | awk '/Number of entries/ {print $4}') || allow_count="N/A"
-gov_count=$(ipset list "$IPSET_GOV_NAME" 2>/dev/null | awk '/Number of entries/ {print $4}') || gov_count="N/A"
-antiscanner_count=$(ipset list "$IPSET_ANTISCANNER_NAME" 2>/dev/null | awk '/Number of entries/ {print $4}') || antiscanner_count="N/A"
+allow_count=$(nft_set_count "$SET_MOBILE_ALLOW") || allow_count="N/A"
+gov_count=$(nft_set_count "$SET_GOV") || gov_count="N/A"
+antiscanner_count=$(nft_set_count "$SET_ANTISCANNER") || antiscanner_count="N/A"
 
 msg="📊 <b>Статистика mobile443</b>
 📅 Период: последние 24 часа
@@ -1906,6 +2043,11 @@ action_status() {
   echo "  Traffic Guard: ${ENABLE_TRAF_GUARD:-false} (government=${ENABLE_TRAF_GUARD_GOVERNMENT:-false}, antiscanner=${ENABLE_TRAF_GUARD_ANTISCANNER:-false})"
   echo "  Mobile allowlist: ${ENABLE_MOBILE_ALLOW:-false}"
   echo "  Telegram/Remnawave: ${ENABLE_TELEGRAM:-false}"
+  if deferred_mode_enabled; then
+    echo "  Режим блокировки: deferred (идентификация через xray access.log)"
+  else
+    echo "  Режим блокировки: immediate (немобильные IP блокируются сразу в nftables)"
+  fi
   echo ""
 
   echo -e "${BOLD}Пулы сетей:${NC}"
@@ -1916,10 +2058,11 @@ action_status() {
   echo "  Ручной allow-лист (manual_allow.conf): $(grep -cE '^[0-9]+\.' "$MANUAL_ALLOW_FILE" 2>/dev/null || echo 0)"
   echo ""
 
-  echo -e "${BOLD}Ipset:${NC}"
+  echo -e "${BOLD}Наборы nftables (таблица ip ${NFT_TABLE}):${NC}"
   local set_name cnt
-  for set_name in "$IPSET_MANUAL_ALLOW_NAME" "$IPSET_ALLOW_NAME" "$IPSET_GOV_NAME" "$IPSET_ANTISCANNER_NAME" "$IPSET_DEFERRED_BLOCK_NAME"; do
-    if cnt=$(ipset list "$set_name" 2>/dev/null | awk '/Number of entries/ {print $4}') && [[ -n "$cnt" ]]; then
+  for set_name in "$SET_MANUAL_ALLOW" "$SET_MOBILE_ALLOW" "$SET_GOV" "$SET_ANTISCANNER" "$SET_DEFERRED"; do
+    if nft list set ip "$NFT_TABLE" "$set_name" >/dev/null 2>&1; then
+      cnt=$(nft_set_count "$set_name")
       echo "  $set_name: ${cnt} записей"
     else
       echo "  $set_name: не создан"
@@ -1927,8 +2070,8 @@ action_status() {
   done
   echo ""
 
-  echo -e "${BOLD}Iptables (счётчики пакетов):${NC}"
-  iptables -L "$CHAIN_NAME" -n -v 2>/dev/null | head -10 || echo "  chain $CHAIN_NAME не найден"
+  echo -e "${BOLD}Правила (счётчики пакетов):${NC}"
+  nft list chain ip "$NFT_TABLE" "$CHAIN_FILTER" 2>/dev/null | sed 's/^/  /' || echo "  цепочка ${CHAIN_FILTER} не найдена"
   echo ""
 
   echo -e "${BOLD}Systemd:${NC}"
@@ -1970,9 +2113,9 @@ action_show_stats() {
   fi
 
   local allow_count gov_count antiscanner_count
-  allow_count=$(ipset list "$IPSET_ALLOW_NAME" 2>/dev/null | awk '/Number of entries/ {print $4}')
-  gov_count=$(ipset list "$IPSET_GOV_NAME" 2>/dev/null | awk '/Number of entries/ {print $4}')
-  antiscanner_count=$(ipset list "$IPSET_ANTISCANNER_NAME" 2>/dev/null | awk '/Number of entries/ {print $4}')
+  allow_count=$(nft_set_count "$SET_MOBILE_ALLOW")
+  gov_count=$(nft_set_count "$SET_GOV")
+  antiscanner_count=$(nft_set_count "$SET_ANTISCANNER")
 
   echo "📅 Период: с последней отправки/сброса статистики"
   echo ""
@@ -2005,6 +2148,27 @@ action_show_stats() {
   pause
 }
 
+# Проверка введённого вручную пути к access.log (сообщения — в stderr,
+# т.к. stdout функции detect_xray_log_cli возвращает сам путь).
+confirm_xray_log_path_cli() {
+  local path="$1" use_anyway
+
+  if [[ -z "$path" ]]; then
+    echo "   ⚠️  Путь не задан: пользователи не будут идентифицироваться," >&2
+    echo "      немобильные IP будут блокироваться без Telegram-уведомлений." >&2
+    return 0
+  fi
+  if [[ -f "$path" ]]; then
+    return 0
+  fi
+
+  echo "   ✖ Файл не найден: $path" >&2
+  echo "     Пока файла нет, идентификация не работает и немобильные IP" >&2
+  echo "     блокируются без Telegram-уведомлений." >&2
+  read -r -p "   Использовать этот путь всё равно? (y/n): " use_anyway < /dev/tty
+  [[ "${use_anyway,,}" == "y" ]]
+}
+
 detect_xray_log_cli() {
   echo "🔍 Поиск access.log от xray/remnanode..." >&2
   local -a candidates=(
@@ -2033,13 +2197,22 @@ detect_xray_log_cli() {
     echo "   Найдены файлы:" >&2
     echo "$found" | while IFS= read -r f; do echo "     - $f" >&2; done
     echo "" >&2
-    read -r -p "   Введите путь или Enter для первого найденного: " user_path < /dev/tty
-    echo "${user_path:-$(echo "$found" | head -1)}"
+    local user_path chosen
+    while true; do
+      read -r -p "   Введите путь или Enter для первого найденного: " user_path < /dev/tty
+      chosen="${user_path:-$(echo "$found" | head -1)}"
+      confirm_xray_log_path_cli "$chosen" && break
+    done
+    echo "$chosen"
     return
   fi
 
   echo "   ⚠️  Автоматически не найден." >&2
-  read -r -p "   Введите полный путь к access.log xray: " manual_path < /dev/tty
+  local manual_path
+  while true; do
+    read -r -p "   Введите полный путь к access.log xray (Enter — пропустить): " manual_path < /dev/tty
+    confirm_xray_log_path_cli "$manual_path" && break
+  done
   echo "$manual_path"
 }
 
@@ -2110,7 +2283,7 @@ action_configure_telegram() {
   fi
 
   local tg_bot_token tg_admin_id remnawave_api_url remnawave_api_token
-  local tg_id_source tg_username_separator tg_custom_message xray_access_log tg_id_choice tg_msg_choice
+  local tg_id_source tg_username_separator tg_custom_message xray_access_log tg_id_choice tg_msg_choice xray_logs_choice
 
   echo ""
   echo "🤖 Токен Telegram бота:"
@@ -2158,8 +2331,19 @@ action_configure_telegram() {
     tg_custom_message=""
   fi
   echo ""
-  xray_access_log="$(detect_xray_log_cli)"
-  echo "   ✅ Используем: ${xray_access_log:-не указан}"
+  echo "📝 Персональные уведомления пользователям требуют xray access.log."
+  echo "   Если логи xray отключены — уведомления пользователям невозможны, и"
+  echo "   немобильные IP будут блокироваться сразу на уровне nftables"
+  echo "   (админ-алерты и статистика работают в любом случае)."
+  echo "   Включено ли у вас логирование xray (access.log)? (y/n)"
+  read -r -p "   > " xray_logs_choice < /dev/tty
+  if [[ "${xray_logs_choice,,}" == "y" ]]; then
+    xray_access_log="$(detect_xray_log_cli)"
+    echo "   ✅ Используем: ${xray_access_log:-не указан}"
+  else
+    xray_access_log=""
+    echo "   ✅ Логи отключены: режим immediate — блокировка сразу в nftables."
+  fi
 
   set_config_key "ENABLE_TELEGRAM" "true"
   set_config_key "TG_ENABLED" "true"
@@ -2176,7 +2360,11 @@ action_configure_telegram() {
   echo -e "${CYAN}⚙️  Разворачиваем Telegram-мониторинг и статистику...${NC}"
   write_telegram_units_cli
   systemctl daemon-reload
-  systemctl enable --now mobile443-monitor.service
+  systemctl enable mobile443-monitor.service
+  # Именно restart, а не enable --now: monitor уже запущен с установки и
+  # держит в памяти старый конфиг (ENABLE_TELEGRAM=false, старый
+  # XRAY_ACCESS_LOG) — без перезапуска он никогда не начнёт блокировать.
+  systemctl restart mobile443-monitor.service
   systemctl enable --now mobile443-stats.timer
 
   echo -e "${CYAN}🔁 Пересобираем правила с учётом новой конфигурации...${NC}"
@@ -2191,7 +2379,7 @@ action_remove() {
   print_header
   echo -e "${RED}${BOLD}🗑️  Полное удаление mobile443${NC}"
   echo ""
-  echo "Будут удалены: правила iptables, ipset, systemd-юниты,"
+  echo "Будут удалены: таблица nftables, systemd-юниты,"
   echo "  ${BASE_DIR}, ${STATE_DIR} и сама консоль mobile443."
   echo ""
   read -r -p "Введите 'yes' для подтверждения: " confirm < /dev/tty
@@ -2212,33 +2400,40 @@ action_remove() {
     systemctl disable "$unit" 2>/dev/null || true
   done
 
-  echo "[*] Удаление правил iptables"
-  local chain proto port
-  for chain in INPUT FORWARD DOCKER-USER; do
-    for proto in tcp udp; do
-      for port in "${remove_ports[@]}"; do
-        while iptables -C "$chain" -p "$proto" --dport "$port" -j "$CHAIN_NAME" 2>/dev/null; do
-          iptables -D "$chain" -p "$proto" --dport "$port" -j "$CHAIN_NAME" || true
+  echo "[*] Удаление правил nftables"
+  nft delete table ip "$NFT_TABLE" 2>/dev/null || true
+
+  # Зачистка legacy-правил iptables/ipset от установок до v0.7
+  if command -v iptables >/dev/null 2>&1; then
+    local chain proto port
+    for chain in INPUT FORWARD DOCKER-USER; do
+      for proto in tcp udp; do
+        for port in "${remove_ports[@]}"; do
+          while iptables -C "$chain" -p "$proto" --dport "$port" -j FILTER_MOBILE_443 2>/dev/null; do
+            iptables -D "$chain" -p "$proto" --dport "$port" -j FILTER_MOBILE_443 || true
+          done
+          while iptables -C "$chain" -p "$proto" -m conntrack --ctdir ORIGINAL --ctorigdstport "$port" -j FILTER_MOBILE_443 2>/dev/null; do
+            iptables -D "$chain" -p "$proto" -m conntrack --ctdir ORIGINAL --ctorigdstport "$port" -j FILTER_MOBILE_443 || true
+          done
         done
       done
     done
-  done
+    iptables -F FILTER_MOBILE_443 2>/dev/null || true
+    iptables -X FILTER_MOBILE_443 2>/dev/null || true
+    iptables -F TRAF_GUARD_PRECHECK 2>/dev/null || true
+    iptables -X TRAF_GUARD_PRECHECK 2>/dev/null || true
+  fi
 
-  iptables -F "$CHAIN_NAME" 2>/dev/null || true
-  iptables -X "$CHAIN_NAME" 2>/dev/null || true
-  iptables -F "$PRECHECK_CHAIN" 2>/dev/null || true
-  iptables -X "$PRECHECK_CHAIN" 2>/dev/null || true
-
-  echo "[*] Удаление ipset"
-  ipset destroy "${IPSET_ALLOW_NAME}_tmp" 2>/dev/null || true
-  ipset destroy "$IPSET_ALLOW_NAME" 2>/dev/null || true
-  ipset destroy "${IPSET_GOV_NAME}_tmp" 2>/dev/null || true
-  ipset destroy "$IPSET_GOV_NAME" 2>/dev/null || true
-  ipset destroy "${IPSET_ANTISCANNER_NAME}_tmp" 2>/dev/null || true
-  ipset destroy "$IPSET_ANTISCANNER_NAME" 2>/dev/null || true
-  ipset destroy "$IPSET_DEFERRED_BLOCK_NAME" 2>/dev/null || true
-  ipset destroy "${IPSET_MANUAL_ALLOW_NAME}_tmp" 2>/dev/null || true
-  ipset destroy "$IPSET_MANUAL_ALLOW_NAME" 2>/dev/null || true
+  if command -v ipset >/dev/null 2>&1; then
+    local legacy_set
+    for legacy_set in allowed_mobile_443_tmp allowed_mobile_443 \
+                      traf_guard_government_tmp traf_guard_government \
+                      traf_guard_antiscanner_tmp traf_guard_antiscanner \
+                      mobile443_deferred_block \
+                      manual_allow_443_tmp manual_allow_443; do
+      ipset destroy "$legacy_set" 2>/dev/null || true
+    done
+  fi
 
   echo "[*] Удаление systemd юнитов"
   rm -f /etc/systemd/system/mobile443-apply.service
@@ -2305,8 +2500,11 @@ EOF
 write_systemd_units() {
   cat > /etc/systemd/system/mobile443-apply.service <<'EOF'
 [Unit]
-Description=Apply mobile443 sets and firewall rules from local cache
-After=network-online.target
+Description=Apply mobile443 nftables ruleset from local cache
+# nftables.service — только упорядочивание: дистрибутивный юнит часто
+# делает `flush ruleset` при старте и снёс бы нашу таблицу, если бы
+# запускался после нас. Если юнит не установлен, зависимость игнорируется.
+After=network-online.target nftables.service
 Wants=network-online.target
 
 [Service]
@@ -2322,7 +2520,7 @@ EOF
   cat > /etc/systemd/system/mobile443-update.service <<'EOF'
 [Unit]
 Description=Refresh mobile443 allowlists and traffic-guard blocklists
-After=network-online.target
+After=network-online.target nftables.service
 Wants=network-online.target
 
 [Service]
@@ -2432,11 +2630,11 @@ print_install_status() {
   echo "    systemctl status mobile443-apply.service --no-pager"
   echo ""
   echo "  Проверка правил:"
-  echo "    iptables -L TRAF_GUARD_PRECHECK -n -v --line-numbers"
-  echo "    iptables -L FILTER_MOBILE_443 -n -v --line-numbers"
-  echo "    ipset list traf_guard_government | head -20"
-  echo "    ipset list traf_guard_antiscanner | head -20"
-  echo "    ipset list allowed_mobile_443 | head -20"
+  echo "    nft list table ip mobile443 | head -40"
+  echo "    nft list chain ip mobile443 filter443"
+  echo "    nft list set ip mobile443 mobile_allow | head -20"
+  echo "    nft list set ip mobile443 tg_government | head -20"
+  echo "    nft list set ip mobile443 deferred_block"
 
   if [[ "${ENABLE_TELEGRAM:-false}" == "true" ]]; then
     echo ""
@@ -2484,32 +2682,41 @@ remove_all() {
   systemctl disable mobile443-update.timer 2>/dev/null || true
   systemctl disable mobile443-apply.service 2>/dev/null || true
 
-  echo "[*] Удаление правил iptables"
-  for chain in INPUT FORWARD DOCKER-USER; do
-    for proto in tcp udp; do
-      for port in "${remove_ports[@]}"; do
-        while iptables -C "$chain" -p "$proto" --dport "$port" -j FILTER_MOBILE_443 2>/dev/null; do
-          iptables -D "$chain" -p "$proto" --dport "$port" -j FILTER_MOBILE_443 || true
+  echo "[*] Удаление правил nftables"
+  if command -v nft >/dev/null 2>&1; then
+    nft delete table ip mobile443 2>/dev/null || true
+  fi
+
+  # Зачистка legacy-правил iptables/ipset от установок до v0.7
+  if command -v iptables >/dev/null 2>&1; then
+    for chain in INPUT FORWARD DOCKER-USER; do
+      for proto in tcp udp; do
+        for port in "${remove_ports[@]}"; do
+          while iptables -C "$chain" -p "$proto" --dport "$port" -j FILTER_MOBILE_443 2>/dev/null; do
+            iptables -D "$chain" -p "$proto" --dport "$port" -j FILTER_MOBILE_443 || true
+          done
+          while iptables -C "$chain" -p "$proto" -m conntrack --ctdir ORIGINAL --ctorigdstport "$port" -j FILTER_MOBILE_443 2>/dev/null; do
+            iptables -D "$chain" -p "$proto" -m conntrack --ctdir ORIGINAL --ctorigdstport "$port" -j FILTER_MOBILE_443 || true
+          done
         done
       done
     done
-  done
 
-  iptables -F FILTER_MOBILE_443 2>/dev/null || true
-  iptables -X FILTER_MOBILE_443 2>/dev/null || true
-  iptables -F TRAF_GUARD_PRECHECK 2>/dev/null || true
-  iptables -X TRAF_GUARD_PRECHECK 2>/dev/null || true
+    iptables -F FILTER_MOBILE_443 2>/dev/null || true
+    iptables -X FILTER_MOBILE_443 2>/dev/null || true
+    iptables -F TRAF_GUARD_PRECHECK 2>/dev/null || true
+    iptables -X TRAF_GUARD_PRECHECK 2>/dev/null || true
+  fi
 
-  echo "[*] Удаление ipset"
-  ipset destroy allowed_mobile_443_tmp 2>/dev/null || true
-  ipset destroy allowed_mobile_443 2>/dev/null || true
-  ipset destroy traf_guard_government_tmp 2>/dev/null || true
-  ipset destroy traf_guard_government 2>/dev/null || true
-  ipset destroy traf_guard_antiscanner_tmp 2>/dev/null || true
-  ipset destroy traf_guard_antiscanner 2>/dev/null || true
-  ipset destroy mobile443_deferred_block 2>/dev/null || true
-  ipset destroy manual_allow_443_tmp 2>/dev/null || true
-  ipset destroy manual_allow_443 2>/dev/null || true
+  if command -v ipset >/dev/null 2>&1; then
+    for legacy_set in allowed_mobile_443_tmp allowed_mobile_443 \
+                      traf_guard_government_tmp traf_guard_government \
+                      traf_guard_antiscanner_tmp traf_guard_antiscanner \
+                      mobile443_deferred_block \
+                      manual_allow_443_tmp manual_allow_443; do
+      ipset destroy "$legacy_set" 2>/dev/null || true
+    done
+  fi
 
   echo "[*] Удаление systemd юнитов"
   rm -f /etc/systemd/system/mobile443-apply.service
