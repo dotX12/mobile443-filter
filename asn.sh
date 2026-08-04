@@ -2808,9 +2808,11 @@ action_change_ports() {
     fi
   done
 
-  # Защита от самоблокировки: предупреждаем, если фильтруем SSH-порт
+  # Защита от самоблокировки: предупреждаем, если фильтруем SSH-порт.
+  # || true — sshd может быть не в PATH или вернуть ненулевой код; это не
+  # должно ронять действие под set -e/pipefail.
   local ssh_ports confirm
-  ssh_ports="$(sshd -T 2>/dev/null | awk '/^port /{print $2}')"
+  ssh_ports="$( { sshd -T 2>/dev/null || /usr/sbin/sshd -T 2>/dev/null; } | awk '/^port /{print $2}' || true)"
   for p in $new_ports; do
     if [[ -n "$ssh_ports" ]] && echo "$ssh_ports" | grep -qx "$p"; then
       echo ""
