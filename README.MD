@@ -359,6 +359,17 @@ bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/r
 - ставит новую версию поверх со старой конфигурацией
 - сохраняет `asns.conf`, если он уже был настроен
 
+Удаление существующей установки:
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main/install.sh || wget -qO- https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main/install.sh) remove
+```
+`remove`:
+- Удаляет все фильтры
+- Удаляет все файлы конфигураций
+- Отключает systemd юниты
+
+
 ### 2. Block-only режим
 
 ```bash
