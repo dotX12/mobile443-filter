@@ -1929,7 +1929,9 @@ EOF
 # under a high packet rate that core saturates (ksoftirqd at 100%) and adds
 # latency to everything else on the box, SSH included. RPS spreads the RX work
 # across cores, RFS keeps each flow on the core running its consumer.
-set -Eeuo pipefail
+# No errexit: this is best-effort tuning — a single unavailable sysfs knob or
+# an empty grep (via pipefail) must not abort the whole run.
+set -uo pipefail
 
 log() { echo "[$(date '+%F %T')] nettune: $*"; }
 
