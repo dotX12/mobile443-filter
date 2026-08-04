@@ -2787,6 +2787,69 @@ action_remove() {
   exit 0
 }
 
+# ---------- Изменить порты фильтрации ----------
+action_change_ports() {
+  print_header
+  echo -e "${CYAN}🔌 Изменение портов фильтрации${NC}"
+  echo ""
+  echo "   Текущие порты: ${PORTS:-443}"
+  echo "   Введите новые порты через пробел (например: 443 8443):"
+  read -r -p "   > " new_ports < /dev/tty
+
+  new_ports="$(echo "$new_ports" | tr -s '[:space:]' ' ' | sed 's/^ *//; s/ *$//')"
+  if [[ -z "$new_ports" ]]; then
+    echo -e "${YELLOW}Отменено: порты не введены.${NC}"; pause; return
+  fi
+
+  local p
+  for p in $new_ports; do
+    if ! [[ "$p" =~ ^[0-9]+$ ]] || (( p < 1 || p > 65535 )); then
+      echo -e "${RED}✖ Некорректный порт: '${p}'. Изменения не применены.${NC}"; pause; return
+    fi
+  done
+
+  # Защита от самоблокировки: предупреждаем, если фильтруем SSH-порт
+  local ssh_ports confirm
+  ssh_ports="$(sshd -T 2>/dev/null | awk '/^port /{print $2}')"
+  for p in $new_ports; do
+    if [[ -n "$ssh_ports" ]] && echo "$ssh_ports" | grep -qx "$p"; then
+      echo ""
+      echo -e "${RED}⚠️  Порт ${p} — это порт SSH.${NC} В immediate-режиме немобильные IP на нём"
+      echo "    будут дропаться — можно потерять доступ. Убедись, что твой IP в ручном"
+      echo "    allow-листе (пункт 4)."
+      read -r -p "    Всё равно фильтровать ${p}? (yes/n): " confirm < /dev/tty
+      [[ "$confirm" == "yes" ]] || { echo "Отменено."; pause; return; }
+    fi
+  done
+
+  local old_ports="${PORTS:-443}"
+
+  # iptables-бэкенд: снять джампы старых портов, иначе они останутся висеть
+  # (nft-бэкенд пересобирает цепочки целиком, там старые порты уходят сами)
+  if [[ "${FIREWALL_BACKEND:-nftables}" == "iptables" ]]; then
+    local chain oport
+    for oport in $old_ports; do
+      for chain in INPUT FORWARD DOCKER-USER; do
+        ipt_delete_jump "$chain" tcp "$oport" 2>/dev/null || true
+        ipt_delete_jump "$chain" udp "$oport" 2>/dev/null || true
+      done
+    done
+  fi
+
+  set_config_key "PORTS" "$new_ports"
+  reload_config
+  read -r -a PORT_LIST <<< "${PORTS:-443}"
+
+  if apply_rules; then
+    echo ""
+    echo -e "${GREEN}✅ Порты фильтрации обновлены: ${old_ports} -> ${new_ports}${NC}"
+    echo "   Применено к файрволу и сохранено в конфиг (переживёт перезагрузку и обновления списков)."
+  else
+    echo -e "${RED}✖ Не удалось применить правила. Проверь: sudo mobile443 -> Статус.${NC}"
+  fi
+  pause
+}
+
 main_menu() {
   while true; do
     print_header
@@ -2799,7 +2862,8 @@ main_menu() {
     echo "  5) 🩺 Статус и диагностика"
     echo "  6) 📊 Статистика (как отправляет бот)"
     echo "  7) 🤖 Настроить Telegram / Remnawave"
-    echo "  8) 🗑️  Удалить mobile443"
+    echo "  8) 🔌 Изменить порты фильтрации"
+    echo "  9) 🗑️  Удалить mobile443"
     echo "  0) Выход"
     echo ""
     read -r -p "Выберите пункт меню: " choice < /dev/tty
@@ -2811,7 +2875,8 @@ main_menu() {
       5) action_status ;;
       6) action_show_stats ;;
       7) action_configure_telegram ;;
-      8) action_remove ;;
+      8) action_change_ports ;;
+      9) action_remove ;;
       0) echo "До встречи!"; exit 0 ;;
       *) ;;
     esac
