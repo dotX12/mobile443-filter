@@ -1716,6 +1716,86 @@ touch "$STATS_BLOCKED_FILE"
 log "Daily stats sent to admin (tg:${TG_ADMIN_ID})"
 EOF
   chmod +x "${BIN_DIR}/mobile443-stats.sh"
+
+  cat > "${BIN_DIR}/mobile443-nettune.sh" <<'EOF'
+#!/usr/bin/env bash
+# Distribute inbound packet processing (RX softirq) across all CPU cores.
+# On a host with a single NIC queue every packet is processed on one core;
+# under a high packet rate that core saturates (ksoftirqd at 100%) and adds
+# latency to everything else on the box, SSH included. RPS spreads the RX work
+# across cores, RFS keeps each flow on the core running its consumer.
+set -Eeuo pipefail
+
+log() { echo "[$(date '+%F %T')] nettune: $*"; }
+
+primary_iface() {
+  local dev
+  dev="$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'dev \K\S+' | head -1)"
+  [[ -n "$dev" ]] && { echo "$dev"; return; }
+  ip -o link show up 2>/dev/null | awk -F': ' '$2!="lo"{print $2; exit}'
+}
+
+IFACE="$(primary_iface)"
+[[ -n "${IFACE:-}" ]] || { log "no interface found, nothing to do"; exit 0; }
+
+NCPU="$(nproc)"
+(( NCPU > 1 )) || { log "single cpu — RPS not needed"; exit 0; }
+
+# full bitmask over all cores
+full_mask=0
+for ((i=0; i<NCPU; i++)); do full_mask=$(( full_mask | (1 << i) )); done
+
+# core currently taking the NIC hardirq — exclude it from RPS so we don't pile
+# softirq back onto the core already busy with napi/hardirq
+irq_core=-1
+irq_line="$(grep -iE "${IFACE}\b|virtio.*input" /proc/interrupts 2>/dev/null | head -1)"
+if [[ -n "$irq_line" ]]; then
+  irq_core="$(awk -v n="$NCPU" '{m=-1;idx=-1;for(i=2;i<=n+1;i++){v=$i+0;if(v>m){m=v;idx=i-2}}print idx}' <<< "$irq_line")"
+fi
+
+rps_mask=$full_mask
+if [[ "$irq_core" =~ ^[0-9]+$ ]] && (( irq_core >= 0 )); then
+  rps_mask=$(( full_mask & ~(1 << irq_core) ))
+  (( rps_mask != 0 )) || rps_mask=$full_mask
+fi
+printf -v rps_hex '%x' "$rps_mask"
+
+# count rx queues; only steer with RPS when the NIC has fewer queues than cores
+rxq=0
+for q in /sys/class/net/"$IFACE"/queues/rx-*; do [[ -d "$q" ]] && rxq=$((rxq+1)); done
+(( rxq > 0 )) || { log "iface=$IFACE has no rx queues in sysfs"; exit 0; }
+
+# global RFS flow table (per-queue tables must sum to <= this value)
+sock_entries=32768
+echo "$sock_entries" > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
+per_queue_flows=$(( sock_entries / rxq ))
+(( per_queue_flows >= 256 )) || per_queue_flows=256
+
+tuned=0
+for q in /sys/class/net/"$IFACE"/queues/rx-*; do
+  if (( rxq < NCPU )) && [[ -w "$q/rps_cpus" ]]; then
+    echo "$rps_hex" > "$q/rps_cpus" 2>/dev/null && tuned=$((tuned+1))
+  fi
+  [[ -w "$q/rps_flow_cnt" ]] && { echo "$per_queue_flows" > "$q/rps_flow_cnt" 2>/dev/null || true; }
+done
+
+log "iface=$IFACE cpus=$NCPU rx_queues=$rxq irq_core=$irq_core rps_cpus=0x$rps_hex rfs_flows/q=$per_queue_flows queues_steered=$tuned"
+EOF
+  chmod +x "${BIN_DIR}/mobile443-nettune.sh"
+
+  # sysctl profile for high packet-rate hosts: bigger backlog and a larger
+  # softirq budget so a burst is drained in-line instead of spilling into
+  # ksoftirqd, plus basic SYN-flood resilience. Persisted across reboots.
+  cat > /etc/sysctl.d/99-mobile443-net.conf <<'EOF'
+# mobile443 network tuning — high packet-rate hosts
+net.core.netdev_max_backlog = 16384
+net.core.netdev_budget = 600
+net.core.netdev_budget_usecs = 8000
+net.core.rps_sock_flow_entries = 32768
+net.core.somaxconn = 4096
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_syncookies = 1
+EOF
 }
 
 write_cli_console() {
@@ -2395,7 +2475,8 @@ action_remove() {
   echo "[*] Остановка и отключение сервисов"
   local unit
   for unit in mobile443-monitor.service mobile443-stats.timer mobile443-stats.service \
-              mobile443-update.timer mobile443-update.service mobile443-apply.service; do
+              mobile443-update.timer mobile443-update.service mobile443-apply.service \
+              mobile443-nettune.service; do
     systemctl stop "$unit" 2>/dev/null || true
     systemctl disable "$unit" 2>/dev/null || true
   done
@@ -2440,6 +2521,7 @@ action_remove() {
   rm -f /etc/systemd/system/mobile443-update.service
   rm -f /etc/systemd/system/mobile443-update.timer
   rm -f /etc/systemd/system/mobile443-monitor.service
+  rm -f /etc/systemd/system/mobile443-nettune.service
   rm -f /etc/systemd/system/mobile443-stats.service
   rm -f /etc/systemd/system/mobile443-stats.timer
   systemctl daemon-reload
@@ -2451,6 +2533,8 @@ action_remove() {
   rm -f /usr/local/sbin/mobile443-apply-cache.sh
   rm -f /usr/local/sbin/mobile443-monitor.sh
   rm -f /usr/local/sbin/mobile443-stats.sh
+  rm -f /usr/local/sbin/mobile443-nettune.sh
+  rm -f /etc/sysctl.d/99-mobile443-net.conf
   rm -rf "$BASE_DIR"
   rm -rf "$STATE_DIR"
 
@@ -2566,6 +2650,23 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
+  cat > /etc/systemd/system/mobile443-nettune.service <<'EOF'
+[Unit]
+Description=Distribute network RX softirq across CPU cores (RPS/RFS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mobile443-nettune.sh
+User=root
+Group=root
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
   if [[ "${ENABLE_TELEGRAM:-false}" == "true" ]]; then
     cat > /etc/systemd/system/mobile443-stats.service <<'EOF'
 [Unit]
@@ -2609,6 +2710,8 @@ enable_services() {
   systemctl enable mobile443-apply.service
   systemctl enable --now mobile443-update.timer
   systemctl enable --now mobile443-monitor.service
+  systemctl enable --now mobile443-nettune.service 2>/dev/null || true
+  sysctl -p /etc/sysctl.d/99-mobile443-net.conf >/dev/null 2>&1 || true
 
   if [[ "${ENABLE_TELEGRAM:-false}" == "true" ]]; then
     systemctl enable --now mobile443-stats.timer
@@ -2676,11 +2779,13 @@ remove_all() {
   systemctl stop mobile443-update.timer 2>/dev/null || true
   systemctl stop mobile443-update.service 2>/dev/null || true
   systemctl stop mobile443-apply.service 2>/dev/null || true
+  systemctl stop mobile443-nettune.service 2>/dev/null || true
 
   systemctl disable mobile443-monitor.service 2>/dev/null || true
   systemctl disable mobile443-stats.timer 2>/dev/null || true
   systemctl disable mobile443-update.timer 2>/dev/null || true
   systemctl disable mobile443-apply.service 2>/dev/null || true
+  systemctl disable mobile443-nettune.service 2>/dev/null || true
 
   echo "[*] Удаление правил nftables"
   if command -v nft >/dev/null 2>&1; then
@@ -2723,6 +2828,7 @@ remove_all() {
   rm -f /etc/systemd/system/mobile443-update.service
   rm -f /etc/systemd/system/mobile443-update.timer
   rm -f /etc/systemd/system/mobile443-monitor.service
+  rm -f /etc/systemd/system/mobile443-nettune.service
   rm -f /etc/systemd/system/mobile443-stats.service
   rm -f /etc/systemd/system/mobile443-stats.timer
   systemctl daemon-reload
@@ -2734,6 +2840,8 @@ remove_all() {
   rm -f "${BIN_DIR}/mobile443-apply-cache.sh"
   rm -f "${BIN_DIR}/mobile443-monitor.sh"
   rm -f "${BIN_DIR}/mobile443-stats.sh"
+  rm -f "${BIN_DIR}/mobile443-nettune.sh"
+  rm -f /etc/sysctl.d/99-mobile443-net.conf
   rm -f "${BIN_DIR}/mobile443"
   rm -rf "$BASE_DIR"
   rm -rf "$STATE_DIR"
