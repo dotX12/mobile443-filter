@@ -818,6 +818,7 @@ SET_GOV="tg_government"
 SET_ANTISCANNER="tg_antiscanner"
 SET_DEFERRED="deferred_block"
 SET_LOG_LIMIT="log_limit"
+SET_BLOCKED="blocked_ips"
 CHAIN_INPUT="prefilter_input"
 CHAIN_FORWARD="prefilter_forward"
 CHAIN_FILTER="filter443"
@@ -904,6 +905,14 @@ deferred_mode_enabled() {
   bool_is_true "$ENABLE_TELEGRAM" \
     && bool_is_true "$ENABLE_MOBILE_ALLOW" \
     && [[ -n "${XRAY_ACCESS_LOG:-}" ]]
+}
+
+# nft + immediate + без Telegram: статистика блокировок берётся из in-kernel
+# счётчиков (counter в цепочке + per-IP набор blocked_ips), поэтому не нужны
+# ни per-packet LOG, ни journal-тейлящий монитор — ~0 нагрузки на userspace CPU.
+kernel_stats_mode() {
+  [[ "${FIREWALL_BACKEND:-nftables}" != "iptables" ]] \
+    && ! bool_is_true "$ENABLE_TELEGRAM"
 }
 
 # Идемпотентный скелет (таблица + deferred-набор) — для monitor, который
@@ -1161,6 +1170,9 @@ build_ruleset() {
     # логирования других IP (в deferred-режиме блокировка начинается
     # именно с LOG-строки)
     echo "add set ip ${NFT_TABLE} ${SET_LOG_LIMIT} { type ipv4_addr; flags dynamic; timeout 2m; size 65536; }"
+    # per-IP учёт заблокированных (immediate без Telegram) — считает ядро,
+    # читается по требованию для статистики; ограничен size + timeout
+    echo "add set ip ${NFT_TABLE} ${SET_BLOCKED} { type ipv4_addr; flags dynamic,timeout; timeout 10m; size 65536; }"
     # priority -10: раньше цепочек Docker/UFW (priority 0). accept у нас
     # не обходит их фильтры (в nftables пакет всё равно пройдёт остальные
     # hook-цепочки), а drop — окончателен.
@@ -1194,11 +1206,15 @@ build_ruleset() {
     echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} ip saddr @${SET_MANUAL_ALLOW} counter accept"
 
     if bool_is_true "$ENABLE_TRAF_GUARD" && bool_is_true "$ENABLE_TRAF_GUARD_GOVERNMENT"; then
-      echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} ip saddr @${SET_GOV} update @${SET_LOG_LIMIT} { ip saddr limit rate 6/minute burst 8 packets } log prefix \"${GOV_LOG_PREFIX}\" level warn"
+      if ! kernel_stats_mode; then
+        echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} ip saddr @${SET_GOV} update @${SET_LOG_LIMIT} { ip saddr limit rate 6/minute burst 8 packets } log prefix \"${GOV_LOG_PREFIX}\" level warn"
+      fi
       echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} ip saddr @${SET_GOV} counter drop"
     fi
     if bool_is_true "$ENABLE_TRAF_GUARD" && bool_is_true "$ENABLE_TRAF_GUARD_ANTISCANNER"; then
-      echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} ip saddr @${SET_ANTISCANNER} update @${SET_LOG_LIMIT} { ip saddr limit rate 6/minute burst 8 packets } log prefix \"${ANTISCANNER_LOG_PREFIX}\" level warn"
+      if ! kernel_stats_mode; then
+        echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} ip saddr @${SET_ANTISCANNER} update @${SET_LOG_LIMIT} { ip saddr limit rate 6/minute burst 8 packets } log prefix \"${ANTISCANNER_LOG_PREFIX}\" level warn"
+      fi
       echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} ip saddr @${SET_ANTISCANNER} counter drop"
     fi
 
@@ -1213,9 +1229,12 @@ build_ruleset() {
         echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} ip saddr @${SET_DEFERRED} counter drop"
         echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} update @${SET_LOG_LIMIT} { ip saddr limit rate 6/minute burst 8 packets } log prefix \"${LOG_PREFIX}\" level warn"
         echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} counter accept"
+      elif kernel_stats_mode; then
+        # immediate без Telegram: считаем в ядре — per-IP в blocked_ips (для
+        # топа) + общий counter, без per-packet LOG и без монитора
+        echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} update @${SET_BLOCKED} { ip saddr counter } counter drop"
       else
-        # immediate: логи xray отключены или Telegram не настроен —
-        # блокируем сразу на уровне файрвола
+        # immediate + Telegram: LOG нужен монитору для админ-алертов
         echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} update @${SET_LOG_LIMIT} { ip saddr limit rate 6/minute burst 8 packets } log prefix \"${LOG_PREFIX}\" level warn"
         echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} counter drop"
       fi
@@ -2384,30 +2403,47 @@ action_show_stats() {
   echo -e "${CYAN}📊 Статистика mobile443${NC}"
   echo ""
 
-  if ! systemctl is-active --quiet mobile443-monitor.service 2>/dev/null; then
-    echo -e "${YELLOW}⚠️  mobile443-monitor.service сейчас не запущен — цифры ниже могут быть неактуальны.${NC}"
-    echo "   Проверить: systemctl status mobile443-monitor.service --no-pager"
-    echo ""
-  fi
-
-  local stats_file="${STATE_DIR}/stats_blocked.txt"
-  local total_blocked=0 unique_ips=0 top_ips=""
-
-  if [[ -f "$stats_file" && -s "$stats_file" ]]; then
-    total_blocked=$(wc -l < "$stats_file" | tr -d ' ')
-    unique_ips=$(awk '{print $3}' "$stats_file" | sort -u | wc -l | tr -d ' ')
-    top_ips=$(awk '{print $3}' "$stats_file" | sort | uniq -c | sort -rn | head -10)
-  fi
-
   local allow_count gov_count antiscanner_count
   allow_count=$(nft_set_count "$SET_MOBILE_ALLOW")
   gov_count=$(nft_set_count "$SET_GOV")
   antiscanner_count=$(nft_set_count "$SET_ANTISCANNER")
 
-  echo "📅 Период: с последней отправки/сброса статистики"
-  echo ""
-  echo "🚫 Заблокировано соединений: ${total_blocked}"
-  echo "🌐 Уникальных заблокированных IP: ${unique_ips}"
+  local total_blocked=0 unique_ips=0 top_ips=""
+
+  if kernel_stats_mode; then
+    # Источник — счётчики ядра nftables (монитор не нужен, CPU не тратится)
+    total_blocked=$(nft list chain ip "$NFT_TABLE" "$CHAIN_FILTER" 2>/dev/null \
+      | grep -oE 'counter packets [0-9]+ bytes [0-9]+ drop' | awk '{s+=$3} END{print s+0}')
+    local blk
+    blk=$(nft list set ip "$NFT_TABLE" "$SET_BLOCKED" 2>/dev/null \
+      | sed -n '/elements = {/,/}/p' | grep -oE '[0-9.]+ counter packets [0-9]+')
+    if [[ -n "$blk" ]]; then
+      unique_ips=$(echo "$blk" | wc -l | tr -d ' ')
+      top_ips=$(echo "$blk" | awk '{print $4, $1}' | sort -rn | head -10 \
+        | awk '{printf "%10s  %s\n", $1, $2}')
+    fi
+    echo "📅 Источник: счётчики ядра nftables (blocked_ips, окно ~10 мин)"
+    echo ""
+    echo "🚫 Заблокировано пакетов (drop): ${total_blocked}"
+    echo "🌐 Активных заблокированных IP (~10 мин): ${unique_ips}"
+  else
+    if ! systemctl is-active --quiet mobile443-monitor.service 2>/dev/null; then
+      echo -e "${YELLOW}⚠️  mobile443-monitor.service сейчас не запущен — цифры ниже могут быть неактуальны.${NC}"
+      echo "   Проверить: systemctl status mobile443-monitor.service --no-pager"
+      echo ""
+    fi
+    local stats_file="${STATE_DIR}/stats_blocked.txt"
+    if [[ -f "$stats_file" && -s "$stats_file" ]]; then
+      total_blocked=$(wc -l < "$stats_file" | tr -d ' ')
+      unique_ips=$(awk '{print $3}' "$stats_file" | sort -u | wc -l | tr -d ' ')
+      top_ips=$(awk '{print $3}' "$stats_file" | sort | uniq -c | sort -rn | head -10)
+    fi
+    echo "📅 Период: с последней отправки/сброса статистики"
+    echo ""
+    echo "🚫 Заблокировано соединений: ${total_blocked}"
+    echo "🌐 Уникальных заблокированных IP: ${unique_ips}"
+  fi
+
   echo "📋 Mobile allowlist: ${allow_count:-N/A}"
   echo "🛑 Traffic Guard government: ${gov_count:-N/A}"
   echo "🛑 Traffic Guard antiscanner: ${antiscanner_count:-N/A}"
@@ -2916,7 +2952,13 @@ enable_services() {
   systemctl daemon-reload
   systemctl enable mobile443-apply.service
   systemctl enable --now mobile443-update.timer
-  systemctl enable --now mobile443-monitor.service
+  if [[ "${FIREWALL_BACKEND:-nftables}" != "iptables" && "${ENABLE_TELEGRAM:-false}" != "true" ]]; then
+    # nft + immediate без Telegram: статистика из in-kernel счётчиков,
+    # journal-тейлящий монитор не нужен — не грузим CPU
+    systemctl disable --now mobile443-monitor.service 2>/dev/null || true
+  else
+    systemctl enable --now mobile443-monitor.service
+  fi
   systemctl enable --now mobile443-nettune.service 2>/dev/null || true
   sysctl -p /etc/sysctl.d/99-mobile443-net.conf >/dev/null 2>&1 || true
 
