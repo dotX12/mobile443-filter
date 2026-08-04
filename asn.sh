@@ -142,6 +142,7 @@ write_config() {
 
   cat > "$CONFIG_FILE" <<EOF
 INSTALL_PROFILE="$INSTALL_PROFILE"
+FIREWALL_BACKEND="${FIREWALL_BACKEND:-nftables}"
 PORTS="$ports"
 ENABLE_TRAF_GUARD="$enable_traf_guard"
 ENABLE_TRAF_GUARD_GOVERNMENT="$enable_traf_guard_government"
@@ -167,6 +168,21 @@ EOF
   chmod 600 "$CONFIG_FILE"
 }
 
+ask_firewall_backend() {
+  echo "🧱 Движок файрвола:"
+  echo "   1) nftables (рекомендуется)"
+  echo "   2) iptables + ipset"
+  local fw_choice
+  read -r -p "   Выберите (1 или 2): " fw_choice < /dev/tty
+  if [[ "$fw_choice" == "2" ]]; then
+    FIREWALL_BACKEND="iptables"
+  else
+    FIREWALL_BACKEND="nftables"
+  fi
+  echo "   ✅ Движок: $FIREWALL_BACKEND"
+  echo ""
+}
+
 interactive_setup_full() {
   local ports tg_choice enable_telegram tg_bot_token tg_admin_id
   local remnawave_api_url remnawave_api_token tg_id_source tg_username_separator
@@ -185,6 +201,8 @@ interactive_setup_full() {
   ports="${ports:-$DEFAULT_PORTS}"
   echo "   ✅ Порты: $ports"
   echo ""
+
+  ask_firewall_backend
 
   echo "📱 Включить уведомления в Telegram? (y/n)"
   echo "   • Пользователям — уведомление при блокировке подключения"
@@ -341,6 +359,8 @@ setup_block_only() {
   echo "   Пример: 443 8443 9443"
   read -r -p "   > " ports < /dev/tty
   ports="${ports:-${PORTS:-$(default_ports_from_existing)}}"
+
+  ask_firewall_backend
 
   write_config \
     "$ports" \
@@ -594,7 +614,13 @@ strip_legacy_rostelecom_from_asns() {
 }
 
 install_packages() {
-  local -a packages=(curl nftables util-linux ca-certificates)
+  local -a packages=(curl util-linux ca-certificates)
+
+  if [[ "${FIREWALL_BACKEND:-nftables}" == "iptables" ]]; then
+    packages+=(iptables ipset)
+  else
+    packages+=(nftables)
+  fi
 
   if [[ "$INSTALL_PROFILE" == "full" ]]; then
     packages+=(jq)
@@ -605,7 +631,7 @@ install_packages() {
 }
 
 reset_config_vars() {
-  unset INSTALL_PROFILE PORTS ENABLE_TRAF_GUARD ENABLE_TRAF_GUARD_GOVERNMENT \
+  unset INSTALL_PROFILE FIREWALL_BACKEND PORTS ENABLE_TRAF_GUARD ENABLE_TRAF_GUARD_GOVERNMENT \
     ENABLE_TRAF_GUARD_ANTISCANNER ENABLE_MOBILE_ALLOW ENABLE_TELEGRAM TG_ENABLED \
     TG_BOT_TOKEN TG_ADMIN_ID XRAY_ACCESS_LOG REMNAWAVE_API_URL REMNAWAVE_API_TOKEN \
     TG_ID_SOURCE TG_CUSTOM_MESSAGE TG_USERNAME_SEPARATOR TRAF_GUARD_BASE_URL GOV_LIST_URL ANTISCANNER_LIST_URL \
@@ -796,6 +822,21 @@ CHAIN_INPUT="prefilter_input"
 CHAIN_FORWARD="prefilter_forward"
 CHAIN_FILTER="filter443"
 
+# Backend selector (nftables|iptables). Read from config.conf; nftables default.
+FIREWALL_BACKEND="${FIREWALL_BACKEND:-nftables}"
+# iptables/ipset names — used only when FIREWALL_BACKEND=iptables
+IPSET_MANUAL_ALLOW_NAME="manual_allow_443"
+IPSET_MANUAL_ALLOW_TMP_NAME="${IPSET_MANUAL_ALLOW_NAME}_tmp"
+IPSET_ALLOW_NAME="allowed_mobile_443"
+IPSET_ALLOW_TMP_NAME="${IPSET_ALLOW_NAME}_tmp"
+IPSET_GOV_NAME="traf_guard_government"
+IPSET_GOV_TMP_NAME="${IPSET_GOV_NAME}_tmp"
+IPSET_ANTISCANNER_NAME="traf_guard_antiscanner"
+IPSET_ANTISCANNER_TMP_NAME="${IPSET_ANTISCANNER_NAME}_tmp"
+IPSET_DEFERRED_BLOCK_NAME="mobile443_deferred_block"
+IPT_PRECHECK_CHAIN="TRAF_GUARD_PRECHECK"
+IPT_CHAIN_NAME="FILTER_MOBILE_443"
+
 LOG_PREFIX="MOBILE443_BLOCK: "
 GOV_LOG_PREFIX="MOBILE443_TG_GOV: "
 ANTISCANNER_LOG_PREFIX="MOBILE443_TG_SCAN: "
@@ -838,8 +879,13 @@ bool_is_true() {
 
 ensure_deps() {
   need_cmd curl
-  need_cmd nft
   need_cmd flock
+  if [[ "${FIREWALL_BACKEND:-nftables}" == "iptables" ]]; then
+    need_cmd iptables
+    need_cmd ipset
+  else
+    need_cmd nft
+  fi
   if bool_is_true "$ENABLE_MOBILE_ALLOW"; then
     need_cmd jq
   fi
@@ -867,6 +913,20 @@ ensure_nft_skeleton() {
 add table ip ${NFT_TABLE}
 add set ip ${NFT_TABLE} ${SET_DEFERRED} { type ipv4_addr; flags timeout; }
 NFTSKEL
+}
+
+# iptables backend: deferred-block ipset must exist before monitor can add IPs
+ensure_ipset_skeleton() {
+  ipset create "$IPSET_DEFERRED_BLOCK_NAME" hash:ip family inet hashsize 4096 maxelem 65536 timeout 3600 -exist 2>/dev/null || true
+}
+
+# Backend-agnostic skeleton for the monitor (may start before full apply).
+ensure_skeleton() {
+  if [[ "${FIREWALL_BACKEND:-nftables}" == "iptables" ]]; then
+    ensure_ipset_skeleton
+  else
+    ensure_nft_skeleton
+  fi
 }
 
 # Число элементов набора — для статуса/статистики. Считаем записи,
@@ -1167,7 +1227,7 @@ build_ruleset() {
   rm -f "$manual_tmp"
 }
 
-apply_rules() {
+apply_rules_nft() {
   ensure_dirs
   build_ruleset "$RULESET_FILE"
   nft -f "$RULESET_FILE"
@@ -1175,6 +1235,140 @@ apply_rules() {
     log "nftables: правила применены (таблица ip ${NFT_TABLE}, режим deferred)"
   else
     log "nftables: правила применены (таблица ip ${NFT_TABLE}, режим immediate)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# iptables + ipset backend (FIREWALL_BACKEND=iptables). Mirrors the nftables
+# filter443 chain: manual_allow -> gov/antiscanner drop -> mobile_allow ->
+# immediate drop (or deferred pass-through). Only the configured ports are
+# hooked, so SSH and other ports are never touched.
+# ---------------------------------------------------------------------------
+ensure_set_pair() {
+  ipset create "$1" hash:net family inet hashsize 65536 maxelem 524288 -exist
+  ipset create "$2" hash:net family inet hashsize 65536 maxelem 524288 -exist
+}
+
+ensure_ipsets() {
+  ensure_set_pair "$IPSET_MANUAL_ALLOW_NAME" "$IPSET_MANUAL_ALLOW_TMP_NAME"
+  if bool_is_true "$ENABLE_TRAF_GUARD"; then
+    bool_is_true "$ENABLE_TRAF_GUARD_GOVERNMENT" && ensure_set_pair "$IPSET_GOV_NAME" "$IPSET_GOV_TMP_NAME"
+    bool_is_true "$ENABLE_TRAF_GUARD_ANTISCANNER" && ensure_set_pair "$IPSET_ANTISCANNER_NAME" "$IPSET_ANTISCANNER_TMP_NAME"
+  fi
+  bool_is_true "$ENABLE_MOBILE_ALLOW" && ensure_set_pair "$IPSET_ALLOW_NAME" "$IPSET_ALLOW_TMP_NAME"
+  ipset create "$IPSET_DEFERRED_BLOCK_NAME" hash:ip family inet hashsize 4096 maxelem 65536 timeout 3600 -exist
+}
+
+# Load a set atomically: fill tmp set from file, swap into the live set.
+rebuild_ipset_from_file() {
+  local target_set="$1" tmp_set="$2" file="$3" label="$4" prefix
+  ipset flush "$tmp_set" 2>/dev/null || true
+  if [[ -s "$file" ]]; then
+    while IFS= read -r prefix || [[ -n "$prefix" ]]; do
+      [[ -n "$prefix" ]] || continue
+      ipset add "$tmp_set" "$prefix" -exist 2>/dev/null || true
+    done < "$file"
+  fi
+  ipset swap "$tmp_set" "$target_set"
+  ipset flush "$tmp_set" 2>/dev/null || true
+  log "ipset ${target_set} refilled (${label})"
+}
+
+ipt_delete_jump() {
+  local chain="$1" proto="$2" port="$3"
+  while iptables -C "$chain" -p "$proto" --dport "$port" -j "$IPT_CHAIN_NAME" 2>/dev/null; do
+    iptables -D "$chain" -p "$proto" --dport "$port" -j "$IPT_CHAIN_NAME" || break
+  done
+}
+
+ipt_prepare_chains() {
+  local hl="-m hashlimit --hashlimit-mode srcip --hashlimit-upto 6/min --hashlimit-burst 8"
+
+  iptables -N "$IPT_PRECHECK_CHAIN" 2>/dev/null || true
+  iptables -F "$IPT_PRECHECK_CHAIN"
+  if bool_is_true "$ENABLE_TRAF_GUARD" && bool_is_true "$ENABLE_TRAF_GUARD_GOVERNMENT"; then
+    iptables -A "$IPT_PRECHECK_CHAIN" -m set --match-set "$IPSET_GOV_NAME" src \
+      $hl --hashlimit-name mob443_gov -j LOG --log-prefix "$GOV_LOG_PREFIX" --log-level 4
+    iptables -A "$IPT_PRECHECK_CHAIN" -m set --match-set "$IPSET_GOV_NAME" src -j DROP
+  fi
+  if bool_is_true "$ENABLE_TRAF_GUARD" && bool_is_true "$ENABLE_TRAF_GUARD_ANTISCANNER"; then
+    iptables -A "$IPT_PRECHECK_CHAIN" -m set --match-set "$IPSET_ANTISCANNER_NAME" src \
+      $hl --hashlimit-name mob443_scan -j LOG --log-prefix "$ANTISCANNER_LOG_PREFIX" --log-level 4
+    iptables -A "$IPT_PRECHECK_CHAIN" -m set --match-set "$IPSET_ANTISCANNER_NAME" src -j DROP
+  fi
+
+  iptables -N "$IPT_CHAIN_NAME" 2>/dev/null || true
+  iptables -F "$IPT_CHAIN_NAME"
+  iptables -A "$IPT_CHAIN_NAME" -m set --match-set "$IPSET_MANUAL_ALLOW_NAME" src -j ACCEPT
+  iptables -A "$IPT_CHAIN_NAME" -j "$IPT_PRECHECK_CHAIN"
+  if bool_is_true "$ENABLE_MOBILE_ALLOW"; then
+    iptables -A "$IPT_CHAIN_NAME" -m set --match-set "$IPSET_ALLOW_NAME" src -j ACCEPT
+    if deferred_mode_enabled; then
+      iptables -A "$IPT_CHAIN_NAME" -m set --match-set "$IPSET_DEFERRED_BLOCK_NAME" src -j DROP
+      iptables -A "$IPT_CHAIN_NAME" $hl --hashlimit-name mob443_blk -j LOG --log-prefix "$LOG_PREFIX" --log-level 4
+      iptables -A "$IPT_CHAIN_NAME" -j ACCEPT
+    else
+      iptables -A "$IPT_CHAIN_NAME" $hl --hashlimit-name mob443_blk -j LOG --log-prefix "$LOG_PREFIX" --log-level 4
+      iptables -A "$IPT_CHAIN_NAME" -j DROP
+    fi
+  else
+    iptables -A "$IPT_CHAIN_NAME" -j RETURN
+  fi
+}
+
+ipt_attach_chain() {
+  local chain port
+  for port in "${PORT_LIST[@]}"; do
+    for chain in INPUT FORWARD; do
+      ipt_delete_jump "$chain" tcp "$port"
+      ipt_delete_jump "$chain" udp "$port"
+      iptables -I "$chain" 1 -p tcp --dport "$port" -j "$IPT_CHAIN_NAME"
+      iptables -I "$chain" 1 -p udp --dport "$port" -j "$IPT_CHAIN_NAME"
+    done
+    if iptables -nL DOCKER-USER >/dev/null 2>&1; then
+      ipt_delete_jump DOCKER-USER tcp "$port"
+      ipt_delete_jump DOCKER-USER udp "$port"
+      iptables -I DOCKER-USER 1 -p tcp --dport "$port" -j "$IPT_CHAIN_NAME"
+      iptables -I DOCKER-USER 1 -p udp --dport "$port" -j "$IPT_CHAIN_NAME"
+    fi
+  done
+}
+
+apply_rules_ipt() {
+  ensure_dirs
+  ensure_ipsets
+
+  local manual_tmp
+  manual_tmp="$(mktemp)"
+  build_manual_allow_file "$manual_tmp"
+  rebuild_ipset_from_file "$IPSET_MANUAL_ALLOW_NAME" "$IPSET_MANUAL_ALLOW_TMP_NAME" "$manual_tmp" "manual allow"
+  rm -f "$manual_tmp"
+
+  if bool_is_true "$ENABLE_TRAF_GUARD" && bool_is_true "$ENABLE_TRAF_GUARD_GOVERNMENT" && [[ -s "$GOV_LIST_FILE" ]]; then
+    rebuild_ipset_from_file "$IPSET_GOV_NAME" "$IPSET_GOV_TMP_NAME" "$GOV_LIST_FILE" "government"
+  fi
+  if bool_is_true "$ENABLE_TRAF_GUARD" && bool_is_true "$ENABLE_TRAF_GUARD_ANTISCANNER" && [[ -s "$ANTISCANNER_LIST_FILE" ]]; then
+    rebuild_ipset_from_file "$IPSET_ANTISCANNER_NAME" "$IPSET_ANTISCANNER_TMP_NAME" "$ANTISCANNER_LIST_FILE" "antiscanner"
+  fi
+  if bool_is_true "$ENABLE_MOBILE_ALLOW" && [[ -s "$ALLOW_CACHE_FILE" ]]; then
+    rebuild_ipset_from_file "$IPSET_ALLOW_NAME" "$IPSET_ALLOW_TMP_NAME" "$ALLOW_CACHE_FILE" "mobile allow"
+  fi
+
+  ipt_prepare_chains
+  ipt_attach_chain
+
+  if deferred_mode_enabled; then
+    log "iptables: правила применены (chain ${IPT_CHAIN_NAME}, режим deferred)"
+  else
+    log "iptables: правила применены (chain ${IPT_CHAIN_NAME}, режим immediate)"
+  fi
+}
+
+apply_rules() {
+  if [[ "${FIREWALL_BACKEND:-nftables}" == "iptables" ]]; then
+    apply_rules_ipt
+  else
+    apply_rules_nft
   fi
 }
 
@@ -1443,6 +1637,17 @@ extract_tg_id() {
 add_to_deferred_block() {
   local ip="$1"
   local timeout="${2:-$DEFERRED_BLOCK_TIMEOUT}"
+
+  if [[ "${FIREWALL_BACKEND:-nftables}" == "iptables" ]]; then
+    # ipset -exist обновляет timeout существующей записи
+    if ipset add "$IPSET_DEFERRED_BLOCK_NAME" "$ip" timeout "$timeout" -exist 2>/dev/null; then
+      log "Added ${ip} to deferred block set for ${timeout}s"
+    else
+      log "WARN: failed to add ${ip} to ipset '${IPSET_DEFERRED_BLOCK_NAME}'"
+    fi
+    return
+  fi
+
   # nft add element падает, если элемент уже есть — сначала удаляем
   # (заодно обновляется timeout существующей блокировки)
   nft delete element ip "$NFT_TABLE" "$SET_DEFERRED" "{ ${ip} }" 2>/dev/null || true
@@ -1618,7 +1823,7 @@ spawn_event_handler() {
 }
 
 ensure_dirs
-ensure_nft_skeleton
+ensure_skeleton
 
 if [[ "${ENABLE_TELEGRAM:-false}" == "true" ]]; then
   if [[ -z "${XRAY_ACCESS_LOG:-}" ]]; then
@@ -2547,7 +2752,7 @@ action_remove() {
 main_menu() {
   while true; do
     print_header
-    echo "Порты: ${PORTS:-443} | Traffic Guard: ${ENABLE_TRAF_GUARD:-false} | Mobile allow: ${ENABLE_MOBILE_ALLOW:-false} | Telegram: ${ENABLE_TELEGRAM:-false}"
+    echo "Движок: ${FIREWALL_BACKEND:-nftables} | Порты: ${PORTS:-443} | Traffic Guard: ${ENABLE_TRAF_GUARD:-false} | Mobile allow: ${ENABLE_MOBILE_ALLOW:-false} | Telegram: ${ENABLE_TELEGRAM:-false}"
     echo ""
     echo "  1) 🔄 Обновить списки сейчас"
     echo "  2) ↩️  Вернуть ASN в полный пул и обновить списки"
