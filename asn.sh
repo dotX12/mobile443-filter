@@ -483,6 +483,13 @@ write_default_asns() {
 31133
 # MOTIV telecom
 31499
+# Phoenix
+214721
+204108
+# Sevtelecom
+59833
+47203
+
 
 EOF
 }
