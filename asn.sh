@@ -407,7 +407,7 @@ write_default_asns() {
 # Beeline / VimpelCom
 3216
 16345
-42842 
+42842
 
 # MegaFon core + related
 31133
