@@ -468,6 +468,13 @@ write_default_asns() {
 59833
 47203
 
+# Custom
+197023
+12714
+25513
+35728
+28761
+41275
 
 EOF
 }
@@ -1191,6 +1198,16 @@ build_ruleset() {
     echo "add rule ip ${NFT_TABLE} ${CHAIN_INPUT} tcp dport { ${ports} } jump ${CHAIN_FILTER}"
     echo "add rule ip ${NFT_TABLE} ${CHAIN_INPUT} udp dport { ${ports} } jump ${CHAIN_FILTER}"
     echo "add rule ip ${NFT_TABLE} ${CHAIN_FORWARD} meta l4proto { tcp, udp } ct original proto-dst { ${ports} } jump ${CHAIN_FILTER}"
+
+    # Обратные пакеты DNAT'нутого соединения (например, ответы бэкенда
+    # relay-проброса на другой хост) приходят в forward с ip saddr =
+    # адрес бэкенда, а не клиента — без этого правила они попадают под
+    # проверку ASN/allow-листов по чужому адресу и дропаются как
+    # "немобильный IP", хотя исходное соединение уже разрешено. ct direction
+    # reply ограничивает bypass только обратным направлением: пакеты
+    # клиент->бэкенд (ct direction original) по-прежнему проходят полную
+    # проверку на каждый пакет, deferred/блокировка мониторингом не задета.
+    echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} ct direction reply ct status dnat counter accept"
 
     # Ручной allow-лист — accept раньше traf_guard-блоклистов и мобильного ASN.
     echo "add rule ip ${NFT_TABLE} ${CHAIN_FILTER} ip saddr @${SET_MANUAL_ALLOW} counter accept"
