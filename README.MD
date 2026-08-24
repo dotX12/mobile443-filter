@@ -371,7 +371,7 @@ Mobile-allowlist строится не только из ASN. Есть пять 
 ### 1. Обычный режим
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main/install.sh || wget -qO- https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main/install.sh || wget -qO- https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main/install.sh)
 ```
 ❗ Первичное обновление списков может занять от 2 до 5 минут ❗
 
@@ -394,7 +394,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/r
 Обновление существующей установки:
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main/install.sh || wget -qO- https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main/install.sh) update
+bash <(curl -Ls https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main/install.sh || wget -qO- https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main/install.sh) update
 ```
 
 `update`:
@@ -409,7 +409,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/r
 Удаление существующей установки:
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main/install.sh || wget -qO- https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main/install.sh) remove
+bash <(curl -Ls https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main/install.sh || wget -qO- https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main/install.sh) remove
 ```
 `remove`:
 - Удаляет все фильтры
@@ -420,7 +420,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/r
 ### 2. Block-only режим
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main/install_block_only.sh || wget -qO- https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main/install_block_only.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main/install_block_only.sh || wget -qO- https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main/install_block_only.sh)
 ```
 
 Этот режим:
@@ -441,7 +441,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/r
 Обновление block-only установки:
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main/install_block_only.sh || wget -qO- https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main/install_block_only.sh) update
+bash <(curl -Ls https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main/install_block_only.sh || wget -qO- https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main/install_block_only.sh) update
 ```
 
 Здесь тоже используется безопасный путь: `backup -> remove -> reinstall`.
@@ -734,13 +734,13 @@ mobile443** (не требует сети и повторного скачива
 Обычный режим:
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main/install.sh || wget -qO- https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main/install.sh) remove
+bash <(curl -Ls https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main/install.sh || wget -qO- https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main/install.sh) remove
 ```
 
 Block-only:
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main/install_block_only.sh || wget -qO- https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main/install_block_only.sh) remove
+bash <(curl -Ls https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main/install_block_only.sh || wget -qO- https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main/install_block_only.sh) remove
 ```
 
 Удаляются только сущности проекта:
