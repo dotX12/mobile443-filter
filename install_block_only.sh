@@ -2,14 +2,14 @@
 # ═══════════════════════════════════════════════════════════
 #  mobile443 block-only installer
 #  Использование:
-#    bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main/install_block_only.sh)
-#    PORTS="443 8443" bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main/install_block_only.sh)
-#    bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main/install_block_only.sh) update
-#    bash <(curl -Ls https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main/install_block_only.sh) remove
+#    bash <(curl -Ls https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main/install_block_only.sh)
+#    PORTS="443 8443" bash <(curl -Ls https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main/install_block_only.sh)
+#    bash <(curl -Ls https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main/install_block_only.sh) update
+#    bash <(curl -Ls https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main/install_block_only.sh) remove
 # ═══════════════════════════════════════════════════════════
 set -Eeuo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main"
+REPO_RAW="https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main"
 SCRIPT_NAME="asn.sh"
 INSTALL_DIR="/tmp/mobile443-installer"
 ACTION="${1:-install}"
