@@ -13,7 +13,7 @@ ASNS_EXCLUDED_FILE="${BASE_DIR}/asns_excluded.conf"
 STATIC_NETWORKS_FILE="${BASE_DIR}/static_networks.conf"
 EXCLUDED_NETWORKS_FILE="${BASE_DIR}/excluded_networks.conf"
 MANUAL_ALLOW_FILE="${BASE_DIR}/manual_allow.conf"
-REPO_RAW_DEFAULT="https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main"
+REPO_RAW_DEFAULT="https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main"
 
 DEFAULT_PORTS="443"
 
