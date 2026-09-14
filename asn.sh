@@ -13,7 +13,7 @@ ASNS_EXCLUDED_FILE="${BASE_DIR}/asns_excluded.conf"
 STATIC_NETWORKS_FILE="${BASE_DIR}/static_networks.conf"
 EXCLUDED_NETWORKS_FILE="${BASE_DIR}/excluded_networks.conf"
 MANUAL_ALLOW_FILE="${BASE_DIR}/manual_allow.conf"
-REPO_RAW_DEFAULT="https://raw.githubusercontent.com/dotX12/mobile443-filter/refs/heads/main"
+REPO_RAW_DEFAULT="https://raw.githubusercontent.com/wh3r3ar3you/mobile443-filter/refs/heads/main"
 
 DEFAULT_PORTS="443"
 
@@ -48,6 +48,49 @@ default_ports_from_existing() {
     fi
   fi
   echo "$DEFAULT_PORTS"
+}
+
+# Разбирает пользовательский ввод портов вида "443,8443,9443-9450" (запятая
+# и/или пробел как разделитель, диапазоны через дефис) в нормализованный
+# список через пробел ("443 8443 9443-9450"), который читает read -a
+# PORT_LIST <<< "$PORTS" ниже по коду. При ошибке печатает причину в stderr
+# и возвращает 1, ничего не печатая в stdout.
+normalize_ports() {
+  local raw="$1" token start end
+  local -a result=()
+
+  raw="${raw//,/ }"
+  for token in $raw; do
+    if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      start="${BASH_REMATCH[1]}"
+      end="${BASH_REMATCH[2]}"
+      if (( start < 1 || start > 65535 || end < 1 || end > 65535 )); then
+        echo "Некорректный диапазон портов: '${token}' (порт должен быть 1-65535)" >&2
+        return 1
+      fi
+      if (( start > end )); then
+        echo "Некорректный диапазон портов: '${token}' (начало больше конца)" >&2
+        return 1
+      fi
+      result+=("${start}-${end}")
+    elif [[ "$token" =~ ^[0-9]+$ ]]; then
+      if (( token < 1 || token > 65535 )); then
+        echo "Некорректный порт: '${token}' (должен быть 1-65535)" >&2
+        return 1
+      fi
+      result+=("$token")
+    else
+      echo "Некорректный порт или диапазон: '${token}'" >&2
+      return 1
+    fi
+  done
+
+  if (( ${#result[@]} == 0 )); then
+    echo "Порты не введены" >&2
+    return 1
+  fi
+
+  echo "${result[*]}"
 }
 
 # Проверяет введённый вручную путь к access.log. Файла может ещё не быть,
@@ -195,10 +238,15 @@ interactive_setup_full() {
   echo ""
 
   echo "📡 На каких портах должен работать фильтр?"
-  echo "   Введите порты через пробел"
-  echo "   Пример: 443 8443 9443 10443 11443 12443 13443"
-  read -r -p "   > " ports < /dev/tty
-  ports="${ports:-$DEFAULT_PORTS}"
+  echo "   Порты через запятую, диапазоны через дефис"
+  echo "   Пример: 443,8443,9443-9450"
+  while true; do
+    read -r -p "   > " ports < /dev/tty
+    ports="${ports:-$DEFAULT_PORTS}"
+    if ports="$(normalize_ports "$ports")"; then
+      break
+    fi
+  done
   echo "   ✅ Порты: $ports"
   echo ""
 
@@ -355,10 +403,15 @@ setup_block_only() {
 
   echo ""
   echo "📡 На каких портах должен работать block-only фильтр?"
-  echo "   Введите порты через пробел"
-  echo "   Пример: 443 8443 9443"
-  read -r -p "   > " ports < /dev/tty
-  ports="${ports:-${PORTS:-$(default_ports_from_existing)}}"
+  echo "   Порты через запятую, диапазоны через дефис"
+  echo "   Пример: 443,8443,9443-9450"
+  while true; do
+    read -r -p "   > " ports < /dev/tty
+    ports="${ports:-${PORTS:-$(default_ports_from_existing)}}"
+    if ports="$(normalize_ports "$ports")"; then
+      break
+    fi
+  done
 
   ask_firewall_backend
 
@@ -1200,7 +1253,7 @@ build_ruleset() {
     echo "add rule ip ${NFT_TABLE} ${CHAIN_FORWARD} meta l4proto { tcp, udp } ct original proto-dst { ${ports} } jump ${CHAIN_FILTER}"
 
     # Обратные пакеты DNAT'нутого соединения (например, ответы бэкенда
-    # relay-проброса на другой хост) приходят в forward с ip saddr =
+    # VLESS/relay-проброса на другой хост) приходят в forward с ip saddr =
     # адрес бэкенда, а не клиента — без этого правила они попадают под
     # проверку ASN/allow-листов по чужому адресу и дропаются как
     # "немобильный IP", хотя исходное соединение уже разрешено. ct direction
@@ -1302,6 +1355,9 @@ rebuild_ipset_from_file() {
 
 ipt_delete_jump() {
   local chain="$1" proto="$2" port="$3"
+  # диапазоны хранятся как "start-end" (формат nftables); iptables --dport
+  # принимает диапазон только как "start:end"
+  port="${port/-/:}"
   while iptables -C "$chain" -p "$proto" --dport "$port" -j "$IPT_CHAIN_NAME" 2>/dev/null; do
     iptables -D "$chain" -p "$proto" --dport "$port" -j "$IPT_CHAIN_NAME" || break
   done
@@ -1343,19 +1399,20 @@ ipt_prepare_chains() {
 }
 
 ipt_attach_chain() {
-  local chain port
+  local chain port ipt_port
   for port in "${PORT_LIST[@]}"; do
+    ipt_port="${port/-/:}"
     for chain in INPUT FORWARD; do
       ipt_delete_jump "$chain" tcp "$port"
       ipt_delete_jump "$chain" udp "$port"
-      iptables -I "$chain" 1 -p tcp --dport "$port" -j "$IPT_CHAIN_NAME"
-      iptables -I "$chain" 1 -p udp --dport "$port" -j "$IPT_CHAIN_NAME"
+      iptables -I "$chain" 1 -p tcp --dport "$ipt_port" -j "$IPT_CHAIN_NAME"
+      iptables -I "$chain" 1 -p udp --dport "$ipt_port" -j "$IPT_CHAIN_NAME"
     done
     if iptables -nL DOCKER-USER >/dev/null 2>&1; then
       ipt_delete_jump DOCKER-USER tcp "$port"
       ipt_delete_jump DOCKER-USER udp "$port"
-      iptables -I DOCKER-USER 1 -p tcp --dport "$port" -j "$IPT_CHAIN_NAME"
-      iptables -I DOCKER-USER 1 -p udp --dport "$port" -j "$IPT_CHAIN_NAME"
+      iptables -I DOCKER-USER 1 -p tcp --dport "$ipt_port" -j "$IPT_CHAIN_NAME"
+      iptables -I DOCKER-USER 1 -p udp --dport "$ipt_port" -j "$IPT_CHAIN_NAME"
     fi
   done
 }
@@ -1426,7 +1483,7 @@ cleanup_tmp() {
 }
 
 update_mobile_allowlist() {
-  local asn line new_count old_count min_safe
+  local asn line new_count old_count
 
   [[ -f "$ASNS_FILE" ]] || {
     echo "ASN file not found: $ASNS_FILE" >&2
@@ -1469,17 +1526,9 @@ update_mobile_allowlist() {
 
   log "Collected mobile prefixes: new=${new_count}, old=${old_count}"
 
-  if [[ "$new_count" -lt 500 ]]; then
+  if [[ "$new_count" -lt 100 ]]; then
     log "Refusing mobile allowlist update: too few prefixes"
     exit 1
-  fi
-
-  if [[ "$old_count" -gt 0 ]]; then
-    min_safe=$(( old_count * 70 / 100 ))
-    if [[ "$new_count" -lt "$min_safe" ]]; then
-      log "Refusing mobile allowlist update: new prefix count dropped too much (need >= ${min_safe})"
-      exit 1
-    fi
   fi
 
   install -m 0644 "$TMP_CLEAN" "$ALLOW_CACHE_FILE"
@@ -1763,7 +1812,7 @@ process_blocked() {
     else
       msg="⚠️ <b>Внимание!</b>
 
-Соединение с IP <code>${src_ip}</code> было прервано. 
+Соединение с IP <code>${src_ip}</code> было прервано.
 
 Данный сервер предназначен <b>исключительно для обхода мобильных глушилок</b>, подключение через Wi-Fi не поддерживается, и соединения будут разрываться автоматически.
 
@@ -2080,6 +2129,48 @@ set_config_key() {
 reload_config() {
   # shellcheck disable=SC1090
   [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+}
+
+# Разбирает пользовательский ввод портов вида "443,8443,9443-9450" (запятая
+# и/или пробел как разделитель, диапазоны через дефис) в нормализованный
+# список через пробел ("443 8443 9443-9450"). При ошибке печатает причину
+# в stderr и возвращает 1, ничего не печатая в stdout.
+normalize_ports() {
+  local raw="$1" token start end
+  local -a result=()
+
+  raw="${raw//,/ }"
+  for token in $raw; do
+    if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      start="${BASH_REMATCH[1]}"
+      end="${BASH_REMATCH[2]}"
+      if (( start < 1 || start > 65535 || end < 1 || end > 65535 )); then
+        echo "Некорректный диапазон портов: '${token}' (порт должен быть 1-65535)" >&2
+        return 1
+      fi
+      if (( start > end )); then
+        echo "Некорректный диапазон портов: '${token}' (начало больше конца)" >&2
+        return 1
+      fi
+      result+=("${start}-${end}")
+    elif [[ "$token" =~ ^[0-9]+$ ]]; then
+      if (( token < 1 || token > 65535 )); then
+        echo "Некорректный порт: '${token}' (должен быть 1-65535)" >&2
+        return 1
+      fi
+      result+=("$token")
+    else
+      echo "Некорректный порт или диапазон: '${token}'" >&2
+      return 1
+    fi
+  done
+
+  if (( ${#result[@]} == 0 )); then
+    echo "Порты не введены" >&2
+    return 1
+  fi
+
+  echo "${result[*]}"
 }
 
 # ---------- 1) Обновить списки ----------
@@ -2736,15 +2827,16 @@ action_remove() {
 
   # Зачистка legacy-правил iptables/ipset от установок до v0.7
   if command -v iptables >/dev/null 2>&1; then
-    local chain proto port
+    local chain proto port ipt_port
     for chain in INPUT FORWARD DOCKER-USER; do
       for proto in tcp udp; do
         for port in "${remove_ports[@]}"; do
-          while iptables -C "$chain" -p "$proto" --dport "$port" -j FILTER_MOBILE_443 2>/dev/null; do
-            iptables -D "$chain" -p "$proto" --dport "$port" -j FILTER_MOBILE_443 || true
+          ipt_port="${port/-/:}"
+          while iptables -C "$chain" -p "$proto" --dport "$ipt_port" -j FILTER_MOBILE_443 2>/dev/null; do
+            iptables -D "$chain" -p "$proto" --dport "$ipt_port" -j FILTER_MOBILE_443 || true
           done
-          while iptables -C "$chain" -p "$proto" -m conntrack --ctdir ORIGINAL --ctorigdstport "$port" -j FILTER_MOBILE_443 2>/dev/null; do
-            iptables -D "$chain" -p "$proto" -m conntrack --ctdir ORIGINAL --ctorigdstport "$port" -j FILTER_MOBILE_443 || true
+          while iptables -C "$chain" -p "$proto" -m conntrack --ctdir ORIGINAL --ctorigdstport "$ipt_port" -j FILTER_MOBILE_443 2>/dev/null; do
+            iptables -D "$chain" -p "$proto" -m conntrack --ctdir ORIGINAL --ctorigdstport "$ipt_port" -j FILTER_MOBILE_443 || true
           done
         done
       done
@@ -2800,36 +2892,46 @@ action_change_ports() {
   echo -e "${CYAN}🔌 Изменение портов фильтрации${NC}"
   echo ""
   echo "   Текущие порты: ${PORTS:-443}"
-  echo "   Введите новые порты через пробел (например: 443 8443):"
-  read -r -p "   > " new_ports < /dev/tty
+  echo "   Порты через запятую, диапазоны через дефис (например: 443,8443,9443-9450):"
+  read -r -p "   > " new_ports_input < /dev/tty
 
-  new_ports="$(echo "$new_ports" | tr -s '[:space:]' ' ' | sed 's/^ *//; s/ *$//')"
-  if [[ -z "$new_ports" ]]; then
+  if [[ -z "$(echo "$new_ports_input" | tr -d '[:space:],')" ]]; then
     echo -e "${YELLOW}Отменено: порты не введены.${NC}"; pause; return
   fi
 
-  local p
-  for p in $new_ports; do
-    if ! [[ "$p" =~ ^[0-9]+$ ]] || (( p < 1 || p > 65535 )); then
-      echo -e "${RED}✖ Некорректный порт: '${p}'. Изменения не применены.${NC}"; pause; return
-    fi
-  done
+  local new_ports
+  if ! new_ports="$(normalize_ports "$new_ports_input")"; then
+    echo -e "${RED}✖ Изменения не применены.${NC}"; pause; return
+  fi
 
-  # Защита от самоблокировки: предупреждаем, если фильтруем SSH-порт.
-  # || true — sshd может быть не в PATH или вернуть ненулевой код; это не
-  # должно ронять действие под set -e/pipefail.
-  local ssh_ports confirm
+  # Защита от самоблокировки: предупреждаем, если фильтруем SSH-порт
+  # (в т.ч. когда он попадает в указанный диапазон). || true — sshd может
+  # быть не в PATH или вернуть ненулевой код; это не должно ронять действие
+  # под set -e/pipefail.
+  local ssh_ports confirm p sp hit
   ssh_ports="$( { sshd -T 2>/dev/null || /usr/sbin/sshd -T 2>/dev/null; } | awk '/^port /{print $2}' || true)"
-  for p in $new_ports; do
-    if [[ -n "$ssh_ports" ]] && echo "$ssh_ports" | grep -qx "$p"; then
-      echo ""
-      echo -e "${RED}⚠️  Порт ${p} — это порт SSH.${NC} В immediate-режиме немобильные IP на нём"
-      echo "    будут дропаться — можно потерять доступ. Убедись, что твой IP в ручном"
-      echo "    allow-листе (пункт 4)."
-      read -r -p "    Всё равно фильтровать ${p}? (yes/n): " confirm < /dev/tty
-      [[ "$confirm" == "yes" ]] || { echo "Отменено."; pause; return; }
-    fi
-  done
+  if [[ -n "$ssh_ports" ]]; then
+    for p in $new_ports; do
+      hit=""
+      if [[ "$p" == *-* ]]; then
+        for sp in $ssh_ports; do
+          if (( sp >= ${p%-*} && sp <= ${p#*-} )); then hit="$sp"; break; fi
+        done
+      else
+        for sp in $ssh_ports; do
+          [[ "$sp" == "$p" ]] && { hit="$sp"; break; }
+        done
+      fi
+      if [[ -n "$hit" ]]; then
+        echo ""
+        echo -e "${RED}⚠️  Порт ${p} включает SSH-порт ${hit}.${NC} В immediate-режиме немобильные IP на нём"
+        echo "    будут дропаться — можно потерять доступ. Убедись, что твой IP в ручном"
+        echo "    allow-листе (пункт 4)."
+        read -r -p "    Всё равно фильтровать ${p}? (yes/n): " confirm < /dev/tty
+        [[ "$confirm" == "yes" ]] || { echo "Отменено."; pause; return; }
+      fi
+    done
+  fi
 
   local old_ports="${PORTS:-443}"
 
@@ -3120,11 +3222,12 @@ remove_all() {
     for chain in INPUT FORWARD DOCKER-USER; do
       for proto in tcp udp; do
         for port in "${remove_ports[@]}"; do
-          while iptables -C "$chain" -p "$proto" --dport "$port" -j FILTER_MOBILE_443 2>/dev/null; do
-            iptables -D "$chain" -p "$proto" --dport "$port" -j FILTER_MOBILE_443 || true
+          ipt_port="${port/-/:}"
+          while iptables -C "$chain" -p "$proto" --dport "$ipt_port" -j FILTER_MOBILE_443 2>/dev/null; do
+            iptables -D "$chain" -p "$proto" --dport "$ipt_port" -j FILTER_MOBILE_443 || true
           done
-          while iptables -C "$chain" -p "$proto" -m conntrack --ctdir ORIGINAL --ctorigdstport "$port" -j FILTER_MOBILE_443 2>/dev/null; do
-            iptables -D "$chain" -p "$proto" -m conntrack --ctdir ORIGINAL --ctorigdstport "$port" -j FILTER_MOBILE_443 || true
+          while iptables -C "$chain" -p "$proto" -m conntrack --ctdir ORIGINAL --ctorigdstport "$ipt_port" -j FILTER_MOBILE_443 2>/dev/null; do
+            iptables -D "$chain" -p "$proto" -m conntrack --ctdir ORIGINAL --ctorigdstport "$ipt_port" -j FILTER_MOBILE_443 || true
           done
         done
       done
